@@ -59,7 +59,7 @@ if(EXISTS "${ANDROID_NDK}")
 	endif()
 
 	if (NDK_CPU_X86)
-		set(ANDROID_TOOLCHAIN_PREFIX "i686-android-linux")
+		set(ANDROID_TOOLCHAIN_PREFIX "i686-linux-android")
 		set(ANDROID_TOOLCHAIN_NAME "x86")
 		set(ANDROID_TOOLCHAIN_PLATFORM_NAME "x86")
 	else()
