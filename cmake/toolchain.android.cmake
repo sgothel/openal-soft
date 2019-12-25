@@ -7,7 +7,7 @@
 #                               (gluegen/make/scripts/setenv-android-tools.sh env var)
 # - ANDROID_NDK              := ${env.ANDROID_NDK}         [/opt/android-sdk/ndk/20.00]
 # - ANDROID_HOST_TAG         := ${env.ANDROID_HOST_TAG}    [linux-x86_64, ..]
-# - ANDROID_API_LEVEL        := ${env.ANDROID_API_LEVEL}   [24]
+# - ANDROID_API_LEVEL        := ${env.ANDROID_API_LEVEL}   [21..22]
 #
 # and one of the following CPU target flags:
 #
@@ -18,6 +18,10 @@
 # - NDK_CPU_ARM
 #
 # (Will be preserved for try_compile() via CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
+#
+# NDK >= r19 using API > 22: 'U __register_atfork'
+#   __register_atfork; # introduced=23
+# See <https://github.com/android/ndk/issues/964>
 
 set(CMAKE_CROSSCOMPILING true)
 
@@ -54,8 +58,8 @@ else()
     set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES ${CMAKE_TRY_COMPILE_PLATFORM_VARIABLES} ANDROID_HOST_TAG)
 endif()
 
-if(NOT ANDROID_API_LEVEL GREATER 2)
-    set(ANDROID_API_LEVEL 24)
+if(NOT ANDROID_API_LEVEL GREATER 20)
+    set(ANDROID_API_LEVEL 22)
     message(STATUS "Using default android API level android-${ANDROID_API_LEVEL}")
 else()
     set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES ${CMAKE_TRY_COMPILE_PLATFORM_VARIABLES} ANDROID_API_LEVEL)
@@ -133,7 +137,7 @@ set(CMAKE_FIND_ROOT_PATH "${ANDROID_NDK_TOOLCHAIN_ROOT}/bin" "${ANDROID_NDK_TOOL
 
 # Using llvm's c++_shared as of NDK r18: https://developer.android.com/ndk/guides/cpp-support.html
 # Also see https://github.com/android/ndk/issues/452 and https://gitlab.kitware.com/cmake/cmake/issues/17059
-set(ANDROID_STL "c++_shared")
+set(ANDROID_STL "c++_static")
 set(STL_INCLUDE_PATH0 "${ANDROID_NDK_SYSROOT1}/usr/include/c++/v1")
 include_directories(BEFORE SYSTEM "${STL_INCLUDE_PATH0}")
 
@@ -180,7 +184,7 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 message(STATUS "NDK_CPU_ARM: ${NDK_CPU_ARM}")
 message(STATUS "NDK_CPU_ARM64: ${NDK_CPU_ARM64}")
 
-set(LINKER_FLAGS "--sysroot=${ANDROID_NDK_SYSROOT0} -L\"${ANDROID_NDK_SYSROOT1_LIB1}\" -Wl,-rpath-link=\"${ANDROID_NDK_SYSROOT1_LIB1}\" -L\"${ANDROID_NDK_SYSROOT1_LIB2}\" -target ${ANDROID_LLVM_TRIPLE}")
+set(LINKER_FLAGS "--sysroot=${ANDROID_NDK_SYSROOT0} -L\"${ANDROID_NDK_SYSROOT1_LIB1}\" -Wl,-rpath-link=\"${ANDROID_NDK_SYSROOT1_LIB1}\" -L\"${ANDROID_NDK_SYSROOT1_LIB2}\" -target ${ANDROID_LLVM_TRIPLE} -static-libstdc++")
 #set(LINKER_FLAGS "${LINKER_FLAGS} -v")
 
 message(STATUS "ARM32_LINKER_OPTS: ${ARM32_LINKER_OPTS}")
