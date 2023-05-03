@@ -17,12 +17,17 @@
 #include "version.h"
 
 
-std::vector<DriverIface> DriverList;
+std::vector<DriverIfacePtr> DriverList;
 
 thread_local DriverIface *ThreadCtxDriver;
 
 enum LogLevel LogLevel = LogLevel_Error;
 FILE *LogFile;
+
+#ifdef __MINGW32__
+DriverIface *GetThreadDriver() noexcept { return ThreadCtxDriver; }
+void SetThreadDriver(DriverIface *driver) noexcept { ThreadCtxDriver = driver; }
+#endif
 
 static void LoadDriverList(void);
 
@@ -79,13 +84,13 @@ static void AddModule(HMODULE module, const WCHAR *name)
 {
     for(auto &drv : DriverList)
     {
-        if(drv.Module == module)
+        if(drv->Module == module)
         {
             TRACE("Skipping already-loaded module %p\n", decltype(std::declval<void*>()){module});
             FreeLibrary(module);
             return;
         }
-        if(drv.Name == name)
+        if(drv->Name == name)
         {
             TRACE("Skipping similarly-named module %ls\n", name);
             FreeLibrary(module);
@@ -93,8 +98,8 @@ static void AddModule(HMODULE module, const WCHAR *name)
         }
     }
 
-    DriverList.emplace_back(name, module);
-    DriverIface &newdrv = DriverList.back();
+    DriverList.emplace_back(std::make_unique<DriverIface>(name, module));
+    DriverIface &newdrv = *DriverList.back();
 
     /* Load required functions. */
     int err = 0;
@@ -184,18 +189,6 @@ static void AddModule(HMODULE module, const WCHAR *name)
     LOAD_PROC(alGenBuffers);
     LOAD_PROC(alDeleteBuffers);
     LOAD_PROC(alIsBuffer);
-    LOAD_PROC(alBufferf);
-    LOAD_PROC(alBuffer3f);
-    LOAD_PROC(alBufferfv);
-    LOAD_PROC(alBufferi);
-    LOAD_PROC(alBuffer3i);
-    LOAD_PROC(alBufferiv);
-    LOAD_PROC(alGetBufferf);
-    LOAD_PROC(alGetBuffer3f);
-    LOAD_PROC(alGetBufferfv);
-    LOAD_PROC(alGetBufferi);
-    LOAD_PROC(alGetBuffer3i);
-    LOAD_PROC(alGetBufferiv);
     LOAD_PROC(alBufferData);
     LOAD_PROC(alDopplerFactor);
     LOAD_PROC(alDopplerVelocity);
@@ -209,7 +202,32 @@ static void AddModule(HMODULE module, const WCHAR *name)
         if(newdrv.alcGetError(nullptr) == ALC_NO_ERROR)
             newdrv.ALCVer = MAKE_ALC_VER(alc_ver[0], alc_ver[1]);
         else
+        {
+            WARN("Failed to query ALC version for %ls, assuming 1.0\n", name);
             newdrv.ALCVer = MAKE_ALC_VER(1, 0);
+        }
+
+#undef LOAD_PROC
+#define LOAD_PROC(x) do {                                                      \
+    newdrv.x = reinterpret_cast<decltype(newdrv.x)>(reinterpret_cast<void*>(   \
+        GetProcAddress(module, #x)));                                          \
+    if(!newdrv.x)                                                              \
+    {                                                                          \
+        WARN("Failed to find optional entry point for %s in %ls\n", #x, name); \
+    }                                                                          \
+} while(0)
+    LOAD_PROC(alBufferf);
+    LOAD_PROC(alBuffer3f);
+    LOAD_PROC(alBufferfv);
+    LOAD_PROC(alBufferi);
+    LOAD_PROC(alBuffer3i);
+    LOAD_PROC(alBufferiv);
+    LOAD_PROC(alGetBufferf);
+    LOAD_PROC(alGetBuffer3f);
+    LOAD_PROC(alGetBufferfv);
+    LOAD_PROC(alGetBufferi);
+    LOAD_PROC(alGetBuffer3i);
+    LOAD_PROC(alGetBufferiv);
 
 #undef LOAD_PROC
 #define LOAD_PROC(x) do {                                                     \
@@ -360,7 +378,7 @@ PtrIntMap::~PtrIntMap()
     mCapacity = 0;
 }
 
-ALenum PtrIntMap::insert(ALvoid *key, ALint value)
+ALenum PtrIntMap::insert(void *key, int value)
 {
     std::lock_guard<std::mutex> maplock{mLock};
     auto iter = std::lower_bound(mKeys, mKeys+mSize, key);
@@ -370,15 +388,15 @@ ALenum PtrIntMap::insert(ALvoid *key, ALint value)
     {
         if(mSize == mCapacity)
         {
-            ALvoid **newkeys{nullptr};
+            void **newkeys{nullptr};
             ALsizei newcap{mCapacity ? (mCapacity<<1) : 4};
             if(newcap > mCapacity)
-                newkeys = static_cast<ALvoid**>(
+                newkeys = static_cast<void**>(
                     al_calloc(16, (sizeof(mKeys[0])+sizeof(mValues[0]))*newcap)
                 );
             if(!newkeys)
                 return AL_OUT_OF_MEMORY;
-            auto newvalues = reinterpret_cast<ALint*>(&newkeys[newcap]);
+            auto newvalues = reinterpret_cast<int*>(&newkeys[newcap]);
 
             if(mKeys)
             {
@@ -404,9 +422,9 @@ ALenum PtrIntMap::insert(ALvoid *key, ALint value)
     return AL_NO_ERROR;
 }
 
-ALint PtrIntMap::removeByKey(ALvoid *key)
+int PtrIntMap::removeByKey(void *key)
 {
-    ALint ret = -1;
+    int ret = -1;
 
     std::lock_guard<std::mutex> maplock{mLock};
     auto iter = std::lower_bound(mKeys, mKeys+mSize, key);
@@ -425,9 +443,9 @@ ALint PtrIntMap::removeByKey(ALvoid *key)
     return ret;
 }
 
-ALint PtrIntMap::lookupByKey(ALvoid *key)
+int PtrIntMap::lookupByKey(void *key)
 {
-    ALint ret = -1;
+    int ret = -1;
 
     std::lock_guard<std::mutex> maplock{mLock};
     auto iter = std::lower_bound(mKeys, mKeys+mSize, key);

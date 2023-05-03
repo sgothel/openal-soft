@@ -24,25 +24,34 @@
 
 #include <atomic>
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 
 #include "AL/al.h"
 #include "AL/alc.h"
 #include "AL/alext.h"
 
-#include "alcontext.h"
-#include "alexcpt.h"
-#include "almalloc.h"
+#include "alc/alu.h"
+#include "alc/context.h"
+#include "alc/inprogext.h"
 #include "alnumeric.h"
-#include "alspan.h"
-#include "alu.h"
+#include "aloptional.h"
 #include "atomic.h"
-#include "event.h"
-#include "inprogext.h"
+#include "core/context.h"
+#include "core/except.h"
+#include "core/mixer/defs.h"
+#include "core/voice.h"
+#include "intrusive_ptr.h"
 #include "opthelpers.h"
 #include "strutils.h"
+
+#ifdef ALSOFT_EAX
+#include "alc/device.h"
+
+#include "eax/globals.h"
+#include "eax/x_ram.h"
+#endif // ALSOFT_EAX
 
 
 namespace {
@@ -94,12 +103,41 @@ const ALchar *GetResamplerName(const Resampler rtype)
     throw std::runtime_error{"Unexpected resampler index"};
 }
 
+al::optional<DistanceModel> DistanceModelFromALenum(ALenum model)
+{
+    switch(model)
+    {
+    case AL_NONE: return DistanceModel::Disable;
+    case AL_INVERSE_DISTANCE: return DistanceModel::Inverse;
+    case AL_INVERSE_DISTANCE_CLAMPED: return DistanceModel::InverseClamped;
+    case AL_LINEAR_DISTANCE: return DistanceModel::Linear;
+    case AL_LINEAR_DISTANCE_CLAMPED: return DistanceModel::LinearClamped;
+    case AL_EXPONENT_DISTANCE: return DistanceModel::Exponent;
+    case AL_EXPONENT_DISTANCE_CLAMPED: return DistanceModel::ExponentClamped;
+    }
+    return al::nullopt;
+}
+ALenum ALenumFromDistanceModel(DistanceModel model)
+{
+    switch(model)
+    {
+    case DistanceModel::Disable: return AL_NONE;
+    case DistanceModel::Inverse: return AL_INVERSE_DISTANCE;
+    case DistanceModel::InverseClamped: return AL_INVERSE_DISTANCE_CLAMPED;
+    case DistanceModel::Linear: return AL_LINEAR_DISTANCE;
+    case DistanceModel::LinearClamped: return AL_LINEAR_DISTANCE_CLAMPED;
+    case DistanceModel::Exponent: return AL_EXPONENT_DISTANCE;
+    case DistanceModel::ExponentClamped: return AL_EXPONENT_DISTANCE_CLAMPED;
+    }
+    throw std::runtime_error{"Unexpected distance model "+std::to_string(static_cast<int>(model))};
+}
+
 } // namespace
 
 /* WARNING: Non-standard export! Not part of any extension, or exposed in the
  * alcFunctions list.
  */
-extern "C" AL_API const ALchar* AL_APIENTRY alsoft_get_version(void)
+AL_API const ALchar* AL_APIENTRY alsoft_get_version(void)
 START_API_FUNC
 {
     static const auto spoof = al::getenv("ALSOFT_SPOOF_VERSION");
@@ -109,25 +147,31 @@ START_API_FUNC
 END_API_FUNC
 
 #define DO_UPDATEPROPS() do {                                                 \
-    if(!context->mDeferUpdates.load(std::memory_order_acquire))               \
+    if(!context->mDeferUpdates)                                               \
         UpdateContextProps(context.get());                                    \
     else                                                                      \
-        context->mPropsClean.clear(std::memory_order_release);                \
+        context->mPropsDirty = true;                                          \
 } while(0)
 
 
-AL_API ALvoid AL_APIENTRY alEnable(ALenum capability)
+AL_API void AL_APIENTRY alEnable(ALenum capability)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
-    std::lock_guard<std::mutex> _{context->mPropLock};
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        context->mSourceDistanceModel = AL_TRUE;
-        DO_UPDATEPROPS();
+        {
+            std::lock_guard<std::mutex> _{context->mPropLock};
+            context->mSourceDistanceModel = true;
+            DO_UPDATEPROPS();
+        }
+        break;
+
+    case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
+        context->setError(AL_INVALID_OPERATION, "Re-enabling AL_STOP_SOURCES_ON_DISCONNECT_SOFT not yet supported");
         break;
 
     default:
@@ -136,18 +180,24 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDisable(ALenum capability)
+AL_API void AL_APIENTRY alDisable(ALenum capability)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
-    std::lock_guard<std::mutex> _{context->mPropLock};
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        context->mSourceDistanceModel = AL_FALSE;
-        DO_UPDATEPROPS();
+        {
+            std::lock_guard<std::mutex> _{context->mPropLock};
+            context->mSourceDistanceModel = false;
+            DO_UPDATEPROPS();
+        }
+        break;
+
+    case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
+        context->mStopVoicesOnDisconnect = false;
         break;
 
     default:
@@ -160,14 +210,18 @@ AL_API ALboolean AL_APIENTRY alIsEnabled(ALenum capability)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return AL_FALSE;
+    if(!context) UNLIKELY return AL_FALSE;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALboolean value{AL_FALSE};
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        value = context->mSourceDistanceModel;
+        value = context->mSourceDistanceModel ? AL_TRUE : AL_FALSE;
+        break;
+
+    case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
+        value = context->mStopVoicesOnDisconnect ? AL_TRUE : AL_FALSE;
         break;
 
     default:
@@ -182,7 +236,7 @@ AL_API ALboolean AL_APIENTRY alGetBoolean(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return AL_FALSE;
+    if(!context) UNLIKELY return AL_FALSE;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALboolean value{AL_FALSE};
@@ -209,12 +263,12 @@ START_API_FUNC
         break;
 
     case AL_DEFERRED_UPDATES_SOFT:
-        if(context->mDeferUpdates.load(std::memory_order_acquire))
+        if(context->mDeferUpdates)
             value = AL_TRUE;
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        if(GAIN_MIX_MAX/context->mGainBoost != 0.0f)
+        if(GainMixMax/context->mGainBoost != 0.0f)
             value = AL_TRUE;
         break;
 
@@ -239,7 +293,7 @@ AL_API ALdouble AL_APIENTRY alGetDouble(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return 0.0;
+    if(!context) UNLIKELY return 0.0;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALdouble value{0.0};
@@ -254,7 +308,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALdouble>(context->mDistanceModel);
+        value = static_cast<ALdouble>(ALenumFromDistanceModel(context->mDistanceModel));
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -262,12 +316,12 @@ START_API_FUNC
         break;
 
     case AL_DEFERRED_UPDATES_SOFT:
-        if(context->mDeferUpdates.load(std::memory_order_acquire))
+        if(context->mDeferUpdates)
             value = static_cast<ALdouble>(AL_TRUE);
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = ALdouble{GAIN_MIX_MAX}/context->mGainBoost;
+        value = ALdouble{GainMixMax}/context->mGainBoost;
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -290,7 +344,7 @@ AL_API ALfloat AL_APIENTRY alGetFloat(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return 0.0f;
+    if(!context) UNLIKELY return 0.0f;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALfloat value{0.0f};
@@ -305,7 +359,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALfloat>(context->mDistanceModel);
+        value = static_cast<ALfloat>(ALenumFromDistanceModel(context->mDistanceModel));
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -313,12 +367,12 @@ START_API_FUNC
         break;
 
     case AL_DEFERRED_UPDATES_SOFT:
-        if(context->mDeferUpdates.load(std::memory_order_acquire))
+        if(context->mDeferUpdates)
             value = static_cast<ALfloat>(AL_TRUE);
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = GAIN_MIX_MAX/context->mGainBoost;
+        value = GainMixMax/context->mGainBoost;
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -341,7 +395,7 @@ AL_API ALint AL_APIENTRY alGetInteger(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return 0;
+    if(!context) UNLIKELY return 0;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALint value{0};
@@ -356,7 +410,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALint>(context->mDistanceModel);
+        value = ALenumFromDistanceModel(context->mDistanceModel);
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -364,12 +418,12 @@ START_API_FUNC
         break;
 
     case AL_DEFERRED_UPDATES_SOFT:
-        if(context->mDeferUpdates.load(std::memory_order_acquire))
+        if(context->mDeferUpdates)
             value = AL_TRUE;
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = static_cast<ALint>(GAIN_MIX_MAX/context->mGainBoost);
+        value = static_cast<ALint>(GainMixMax/context->mGainBoost);
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -380,6 +434,41 @@ START_API_FUNC
         value = static_cast<int>(ResamplerDefault);
         break;
 
+#ifdef ALSOFT_EAX
+
+#define EAX_ERROR "[alGetInteger] EAX not enabled."
+
+    case AL_EAX_RAM_SIZE:
+        if (eax_g_is_enabled)
+        {
+            value = eax_x_ram_max_size;
+        }
+        else
+        {
+            context->setError(AL_INVALID_VALUE, EAX_ERROR);
+        }
+
+        break;
+
+    case AL_EAX_RAM_FREE:
+        if (eax_g_is_enabled)
+        {
+            auto device = context->mALDevice.get();
+            std::lock_guard<std::mutex> device_lock{device->BufferLock};
+
+            value = static_cast<ALint>(device->eax_x_ram_free_size);
+        }
+        else
+        {
+            context->setError(AL_INVALID_VALUE, EAX_ERROR);
+        }
+
+        break;
+
+#undef EAX_ERROR
+
+#endif // ALSOFT_EAX
+
     default:
         context->setError(AL_INVALID_VALUE, "Invalid integer property 0x%04x", pname);
     }
@@ -388,11 +477,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-extern "C" AL_API ALint64SOFT AL_APIENTRY alGetInteger64SOFT(ALenum pname)
+AL_API ALint64SOFT AL_APIENTRY alGetInteger64SOFT(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return 0_i64;
+    if(!context) UNLIKELY return 0_i64;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     ALint64SOFT value{0};
@@ -407,7 +496,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALint64SOFT>(context->mDistanceModel);
+        value = ALenumFromDistanceModel(context->mDistanceModel);
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -415,12 +504,12 @@ START_API_FUNC
         break;
 
     case AL_DEFERRED_UPDATES_SOFT:
-        if(context->mDeferUpdates.load(std::memory_order_acquire))
+        if(context->mDeferUpdates)
             value = AL_TRUE;
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = static_cast<ALint64SOFT>(GAIN_MIX_MAX/context->mGainBoost);
+        value = static_cast<ALint64SOFT>(GainMixMax/context->mGainBoost);
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -439,11 +528,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API void* AL_APIENTRY alGetPointerSOFT(ALenum pname)
+AL_API ALvoid* AL_APIENTRY alGetPointerSOFT(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return nullptr;
+    if(!context) UNLIKELY return nullptr;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     void *value{nullptr};
@@ -465,7 +554,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetBooleanv(ALenum pname, ALboolean *values)
+AL_API void AL_APIENTRY alGetBooleanv(ALenum pname, ALboolean *values)
 START_API_FUNC
 {
     if(values)
@@ -486,7 +575,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -498,7 +587,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetDoublev(ALenum pname, ALdouble *values)
+AL_API void AL_APIENTRY alGetDoublev(ALenum pname, ALdouble *values)
 START_API_FUNC
 {
     if(values)
@@ -519,7 +608,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -531,7 +620,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetFloatv(ALenum pname, ALfloat *values)
+AL_API void AL_APIENTRY alGetFloatv(ALenum pname, ALfloat *values)
 START_API_FUNC
 {
     if(values)
@@ -552,7 +641,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -564,7 +653,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetIntegerv(ALenum pname, ALint *values)
+AL_API void AL_APIENTRY alGetIntegerv(ALenum pname, ALint *values)
 START_API_FUNC
 {
     if(values)
@@ -585,7 +674,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -597,7 +686,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-extern "C" AL_API void AL_APIENTRY alGetInteger64vSOFT(ALenum pname, ALint64SOFT *values)
+AL_API void AL_APIENTRY alGetInteger64vSOFT(ALenum pname, ALint64SOFT *values)
 START_API_FUNC
 {
     if(values)
@@ -618,7 +707,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -630,7 +719,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API void AL_APIENTRY alGetPointervSOFT(ALenum pname, void **values)
+AL_API void AL_APIENTRY alGetPointervSOFT(ALenum pname, ALvoid **values)
 START_API_FUNC
 {
     if(values)
@@ -645,7 +734,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!values)
         context->setError(AL_INVALID_VALUE, "NULL pointer");
@@ -661,7 +750,7 @@ AL_API const ALchar* AL_APIENTRY alGetString(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return nullptr;
+    if(!context) UNLIKELY return nullptr;
 
     const ALchar *value{nullptr};
     switch(pname)
@@ -713,11 +802,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDopplerFactor(ALfloat value)
+AL_API void AL_APIENTRY alDopplerFactor(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!(value >= 0.0f && std::isfinite(value)))
         context->setError(AL_INVALID_VALUE, "Doppler factor %f out of range", value);
@@ -730,25 +819,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDopplerVelocity(ALfloat value)
+AL_API void AL_APIENTRY alDopplerVelocity(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
-
-    if((context->mEnabledEvts.load(std::memory_order_relaxed)&EventType_Deprecated))
-    {
-        std::lock_guard<std::mutex> _{context->mEventCbLock};
-        ALbitfieldSOFT enabledevts{context->mEnabledEvts.load(std::memory_order_relaxed)};
-        if((enabledevts&EventType_Deprecated) && context->mEventCb)
-        {
-            static const char msg[] =
-                "alDopplerVelocity is deprecated in AL1.1, use alSpeedOfSound";
-            const ALsizei msglen{sizeof(msg)-1};
-            (*context->mEventCb)(AL_EVENT_TYPE_DEPRECATED_SOFT, 0, 0, msglen, msg,
-                context->mEventParam);
-        }
-    }
+    if(!context) UNLIKELY return;
 
     if(!(value >= 0.0f && std::isfinite(value)))
         context->setError(AL_INVALID_VALUE, "Doppler velocity %f out of range", value);
@@ -761,11 +836,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alSpeedOfSound(ALfloat value)
+AL_API void AL_APIENTRY alSpeedOfSound(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     if(!(value > 0.0f && std::isfinite(value)))
         context->setError(AL_INVALID_VALUE, "Speed of sound %f out of range", value);
@@ -778,44 +853,43 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDistanceModel(ALenum value)
+AL_API void AL_APIENTRY alDistanceModel(ALenum value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
-    if(!(value == AL_INVERSE_DISTANCE || value == AL_INVERSE_DISTANCE_CLAMPED ||
-         value == AL_LINEAR_DISTANCE || value == AL_LINEAR_DISTANCE_CLAMPED ||
-         value == AL_EXPONENT_DISTANCE || value == AL_EXPONENT_DISTANCE_CLAMPED ||
-         value == AL_NONE))
-        context->setError(AL_INVALID_VALUE, "Distance model 0x%04x out of range", value);
-    else
+    if(auto model = DistanceModelFromALenum(value))
     {
         std::lock_guard<std::mutex> _{context->mPropLock};
-        context->mDistanceModel = static_cast<DistanceModel>(value);
+        context->mDistanceModel = *model;
         if(!context->mSourceDistanceModel)
             DO_UPDATEPROPS();
     }
+    else
+        context->setError(AL_INVALID_VALUE, "Distance model 0x%04x out of range", value);
 }
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alDeferUpdatesSOFT(void)
+AL_API void AL_APIENTRY alDeferUpdatesSOFT(void)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
+    std::lock_guard<std::mutex> _{context->mPropLock};
     context->deferUpdates();
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alProcessUpdatesSOFT(void)
+AL_API void AL_APIENTRY alProcessUpdatesSOFT(void)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
+    std::lock_guard<std::mutex> _{context->mPropLock};
     context->processUpdates();
 }
 END_API_FUNC
@@ -825,7 +899,7 @@ AL_API const ALchar* AL_APIENTRY alGetStringiSOFT(ALenum pname, ALsizei index)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return nullptr;
+    if(!context) UNLIKELY return nullptr;
 
     const ALchar *value{nullptr};
     switch(pname)
@@ -848,12 +922,12 @@ END_API_FUNC
 void UpdateContextProps(ALCcontext *context)
 {
     /* Get an unused proprty container, or allocate a new one as needed. */
-    ALcontextProps *props{context->mFreeContextProps.load(std::memory_order_acquire)};
+    ContextProps *props{context->mFreeContextProps.load(std::memory_order_acquire)};
     if(!props)
-        props = new ALcontextProps{};
+        props = new ContextProps{};
     else
     {
-        ALcontextProps *next;
+        ContextProps *next;
         do {
             next = props->next.load(std::memory_order_relaxed);
         } while(context->mFreeContextProps.compare_exchange_weak(props, next,
@@ -861,6 +935,15 @@ void UpdateContextProps(ALCcontext *context)
     }
 
     /* Copy in current property values. */
+    ALlistener &listener = context->mListener;
+    props->Position = listener.Position;
+    props->Velocity = listener.Velocity;
+    props->OrientAt = listener.OrientAt;
+    props->OrientUp = listener.OrientUp;
+    props->Gain = listener.Gain;
+    props->MetersPerUnit = listener.mMetersPerUnit;
+
+    props->AirAbsorptionGainHF = context->mAirAbsorptionGainHF;
     props->DopplerFactor = context->mDopplerFactor;
     props->DopplerVelocity = context->mDopplerVelocity;
     props->SpeedOfSound = context->mSpeedOfSound;
@@ -869,7 +952,7 @@ void UpdateContextProps(ALCcontext *context)
     props->mDistanceModel = context->mDistanceModel;
 
     /* Set the new container for updating internal parameters. */
-    props = context->mUpdate.exchange(props, std::memory_order_acq_rel);
+    props = context->mParams.ContextUpdate.exchange(props, std::memory_order_acq_rel);
     if(props)
     {
         /* If there was an unused update container, put it back in the

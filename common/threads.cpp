@@ -20,18 +20,22 @@
 
 #include "config.h"
 
+#include "opthelpers.h"
 #include "threads.h"
 
 #include <system_error>
 
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include <limits>
 
 void althrd_setname(const char *name)
 {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(_M_ARM)
+
 #define MS_VC_EXCEPTION 0x406D1388
 #pragma pack(push,8)
     struct {
@@ -52,7 +56,9 @@ void althrd_setname(const char *name)
     __except(EXCEPTION_CONTINUE_EXECUTION) {
     }
 #undef MS_VC_EXCEPTION
+
 #else
+
     (void)name;
 #endif
 }
@@ -73,47 +79,65 @@ semaphore::~semaphore()
 
 void semaphore::post()
 {
-    if(!ReleaseSemaphore(mSem, 1, nullptr))
+    if(!ReleaseSemaphore(static_cast<HANDLE>(mSem), 1, nullptr))
         throw std::system_error(std::make_error_code(std::errc::value_too_large));
 }
 
 void semaphore::wait() noexcept
-{ WaitForSingleObject(mSem, INFINITE); }
+{ WaitForSingleObject(static_cast<HANDLE>(mSem), INFINITE); }
 
 bool semaphore::try_wait() noexcept
-{ return WaitForSingleObject(mSem, 0) == WAIT_OBJECT_0; }
+{ return WaitForSingleObject(static_cast<HANDLE>(mSem), 0) == WAIT_OBJECT_0; }
 
 } // namespace al
 
 #else
 
-#if defined(HAVE_PTHREAD_SETNAME_NP) || defined(HAVE_PTHREAD_SET_NAME_NP)
 #include <pthread.h>
 #ifdef HAVE_PTHREAD_NP_H
 #include <pthread_np.h>
 #endif
+#include <tuple>
+
+namespace {
+
+using setname_t1 = int(*)(const char*);
+using setname_t2 = int(*)(pthread_t, const char*);
+using setname_t3 = void(*)(pthread_t, const char*);
+using setname_t4 = int(*)(pthread_t, const char*, void*);
+
+void setname_caller(setname_t1 func, const char *name)
+{ func(name); }
+
+void setname_caller(setname_t2 func, const char *name)
+{ func(pthread_self(), name); }
+
+void setname_caller(setname_t3 func, const char *name)
+{ func(pthread_self(), name); }
+
+void setname_caller(setname_t4 func, const char *name)
+{ func(pthread_self(), "%s", static_cast<void*>(const_cast<char*>(name))); }
+
+} // namespace
 
 void althrd_setname(const char *name)
 {
 #if defined(HAVE_PTHREAD_SET_NAME_NP)
-    pthread_set_name_np(pthread_self(), name);
-#elif defined(PTHREAD_SETNAME_NP_ONE_PARAM)
-    pthread_setname_np(name);
-#elif defined(PTHREAD_SETNAME_NP_THREE_PARAMS)
-    pthread_setname_np(pthread_self(), "%s", (void*)name);
-#else
-    pthread_setname_np(pthread_self(), name);
+    setname_caller(pthread_set_name_np, name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP)
+    setname_caller(pthread_setname_np, name);
 #endif
+    /* Avoid unused function/parameter warnings. */
+    std::ignore = name;
+    std::ignore = static_cast<void(*)(setname_t1,const char*)>(&setname_caller);
+    std::ignore = static_cast<void(*)(setname_t2,const char*)>(&setname_caller);
+    std::ignore = static_cast<void(*)(setname_t3,const char*)>(&setname_caller);
+    std::ignore = static_cast<void(*)(setname_t4,const char*)>(&setname_caller);
 }
 
-#else
-
-void althrd_setname(const char*) { }
-#endif
+#ifdef __APPLE__
 
 namespace al {
-
-#ifdef __APPLE__
 
 semaphore::semaphore(unsigned int initial)
 {
@@ -134,9 +158,13 @@ void semaphore::wait() noexcept
 bool semaphore::try_wait() noexcept
 { return dispatch_semaphore_wait(mSem, DISPATCH_TIME_NOW) == 0; }
 
+} // namespace al
+
 #else /* !__APPLE__ */
 
 #include <cerrno>
+
+namespace al {
 
 semaphore::semaphore(unsigned int initial)
 {
@@ -162,8 +190,8 @@ void semaphore::wait() noexcept
 bool semaphore::try_wait() noexcept
 { return sem_trywait(&mSem) == 0; }
 
-#endif /* __APPLE__ */
-
 } // namespace al
+
+#endif /* __APPLE__ */
 
 #endif /* _WIN32 */

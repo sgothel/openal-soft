@@ -23,6 +23,7 @@
 #include "auxeffectslot.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <iterator>
 #include <memory>
@@ -34,31 +35,65 @@
 #include "AL/alc.h"
 #include "AL/efx.h"
 
-#include "alcmain.h"
-#include "alcontext.h"
-#include "alexcpt.h"
+#include "albit.h"
+#include "alc/alu.h"
+#include "alc/context.h"
+#include "alc/device.h"
+#include "alc/inprogext.h"
 #include "almalloc.h"
 #include "alnumeric.h"
 #include "alspan.h"
-#include "alu.h"
+#include "buffer.h"
+#include "core/except.h"
+#include "core/fpu_ctrl.h"
+#include "core/logging.h"
 #include "effect.h"
-#include "fpu_modes.h"
-#include "inprogext.h"
-#include "logging.h"
 #include "opthelpers.h"
 
-
 namespace {
+
+struct FactoryItem {
+    EffectSlotType Type;
+    EffectStateFactory* (&GetFactory)(void);
+};
+constexpr FactoryItem FactoryList[] = {
+    { EffectSlotType::None, NullStateFactory_getFactory },
+    { EffectSlotType::EAXReverb, ReverbStateFactory_getFactory },
+    { EffectSlotType::Reverb, StdReverbStateFactory_getFactory },
+    { EffectSlotType::Autowah, AutowahStateFactory_getFactory },
+    { EffectSlotType::Chorus, ChorusStateFactory_getFactory },
+    { EffectSlotType::Compressor, CompressorStateFactory_getFactory },
+    { EffectSlotType::Distortion, DistortionStateFactory_getFactory },
+    { EffectSlotType::Echo, EchoStateFactory_getFactory },
+    { EffectSlotType::Equalizer, EqualizerStateFactory_getFactory },
+    { EffectSlotType::Flanger, FlangerStateFactory_getFactory },
+    { EffectSlotType::FrequencyShifter, FshifterStateFactory_getFactory },
+    { EffectSlotType::RingModulator, ModulatorStateFactory_getFactory },
+    { EffectSlotType::PitchShifter, PshifterStateFactory_getFactory },
+    { EffectSlotType::VocalMorpher, VmorpherStateFactory_getFactory },
+    { EffectSlotType::DedicatedDialog, DedicatedStateFactory_getFactory },
+    { EffectSlotType::DedicatedLFE, DedicatedStateFactory_getFactory },
+    { EffectSlotType::Convolution, ConvolutionStateFactory_getFactory },
+};
+
+EffectStateFactory *getFactoryByType(EffectSlotType type)
+{
+    auto iter = std::find_if(std::begin(FactoryList), std::end(FactoryList),
+        [type](const FactoryItem &item) noexcept -> bool
+        { return item.Type == type; });
+    return (iter != std::end(FactoryList)) ? iter->GetFactory() : nullptr;
+}
+
 
 inline ALeffectslot *LookupEffectSlot(ALCcontext *context, ALuint id) noexcept
 {
     const size_t lidx{(id-1) >> 6};
     const ALuint slidx{(id-1) & 0x3f};
 
-    if UNLIKELY(lidx >= context->mEffectSlotList.size())
+    if(lidx >= context->mEffectSlotList.size()) UNLIKELY
         return nullptr;
     EffectSlotSubList &sublist{context->mEffectSlotList[lidx]};
-    if UNLIKELY(sublist.FreeMask & (1_u64 << slidx))
+    if(sublist.FreeMask & (1_u64 << slidx)) UNLIKELY
         return nullptr;
     return sublist.EffectSlots + slidx;
 }
@@ -68,29 +103,40 @@ inline ALeffect *LookupEffect(ALCdevice *device, ALuint id) noexcept
     const size_t lidx{(id-1) >> 6};
     const ALuint slidx{(id-1) & 0x3f};
 
-    if UNLIKELY(lidx >= device->EffectList.size())
+    if(lidx >= device->EffectList.size()) UNLIKELY
         return nullptr;
     EffectSubList &sublist = device->EffectList[lidx];
-    if UNLIKELY(sublist.FreeMask & (1_u64 << slidx))
+    if(sublist.FreeMask & (1_u64 << slidx)) UNLIKELY
         return nullptr;
     return sublist.Effects + slidx;
 }
 
-
-void AddActiveEffectSlots(const ALuint *slotids, size_t count, ALCcontext *context)
+inline ALbuffer *LookupBuffer(ALCdevice *device, ALuint id) noexcept
 {
-    if(count < 1) return;
-    ALeffectslotArray *curarray{context->mActiveAuxSlots.load(std::memory_order_acquire)};
-    size_t newcount{curarray->size() + count};
+    const size_t lidx{(id-1) >> 6};
+    const ALuint slidx{(id-1) & 0x3f};
+
+    if(lidx >= device->BufferList.size()) UNLIKELY
+        return nullptr;
+    BufferSubList &sublist = device->BufferList[lidx];
+    if(sublist.FreeMask & (1_u64 << slidx)) UNLIKELY
+        return nullptr;
+    return sublist.Buffers + slidx;
+}
+
+
+void AddActiveEffectSlots(const al::span<ALeffectslot*> auxslots, ALCcontext *context)
+{
+    if(auxslots.empty()) return;
+    EffectSlotArray *curarray{context->mActiveAuxSlots.load(std::memory_order_acquire)};
+    size_t newcount{curarray->size() + auxslots.size()};
 
     /* Insert the new effect slots into the head of the array, followed by the
      * existing ones.
      */
-    ALeffectslotArray *newarray = ALeffectslot::CreatePtrArray(newcount);
-    auto slotiter = std::transform(slotids, slotids+count, newarray->begin(),
-        [context](ALuint id) noexcept -> ALeffectslot*
-        { return LookupEffectSlot(context, id); }
-    );
+    EffectSlotArray *newarray = EffectSlot::CreatePtrArray(newcount);
+    auto slotiter = std::transform(auxslots.begin(), auxslots.end(), newarray->begin(),
+        [](ALeffectslot *auxslot) noexcept { return auxslot->mSlot; });
     std::copy(curarray->begin(), curarray->end(), slotiter);
 
     /* Remove any duplicates (first instance of each will be kept). */
@@ -106,70 +152,99 @@ void AddActiveEffectSlots(const ALuint *slotids, size_t count, ALCcontext *conte
     /* Reallocate newarray if the new size ended up smaller from duplicate
      * removal.
      */
-    if UNLIKELY(newcount < newarray->size())
+    if(newcount < newarray->size()) UNLIKELY
     {
         curarray = newarray;
-        newarray = ALeffectslot::CreatePtrArray(newcount);
+        newarray = EffectSlot::CreatePtrArray(newcount);
         std::copy_n(curarray->begin(), newcount, newarray->begin());
         delete curarray;
         curarray = nullptr;
     }
+    std::uninitialized_fill_n(newarray->end(), newcount, nullptr);
 
     curarray = context->mActiveAuxSlots.exchange(newarray, std::memory_order_acq_rel);
-    ALCdevice *device{context->mDevice.get()};
-    while((device->MixCount.load(std::memory_order_acquire)&1))
-        std::this_thread::yield();
+    context->mDevice->waitForMix();
+
+    al::destroy_n(curarray->end(), curarray->size());
     delete curarray;
 }
 
-void RemoveActiveEffectSlots(const ALuint *slotids, size_t count, ALCcontext *context)
+void RemoveActiveEffectSlots(const al::span<ALeffectslot*> auxslots, ALCcontext *context)
 {
-    if(count < 1) return;
-    ALeffectslotArray *curarray{context->mActiveAuxSlots.load(std::memory_order_acquire)};
+    if(auxslots.empty()) return;
+    EffectSlotArray *curarray{context->mActiveAuxSlots.load(std::memory_order_acquire)};
 
     /* Don't shrink the allocated array size since we don't know how many (if
      * any) of the effect slots to remove are in the array.
      */
-    ALeffectslotArray *newarray = ALeffectslot::CreatePtrArray(curarray->size());
+    EffectSlotArray *newarray = EffectSlot::CreatePtrArray(curarray->size());
 
-    /* Copy each element in curarray to newarray whose ID is not in slotids. */
-    const ALuint *slotids_end{slotids + count};
-    auto slotiter = std::copy_if(curarray->begin(), curarray->end(), newarray->begin(),
-        [slotids, slotids_end](const ALeffectslot *slot) -> bool
-        { return std::find(slotids, slotids_end, slot->id) == slotids_end; }
-    );
+    auto new_end = std::copy(curarray->begin(), curarray->end(), newarray->begin());
+    /* Remove elements from newarray that match any ID in slotids. */
+    for(const ALeffectslot *auxslot : auxslots)
+    {
+        auto slot_match = [auxslot](EffectSlot *slot) noexcept -> bool
+        { return (slot == auxslot->mSlot); };
+        new_end = std::remove_if(newarray->begin(), new_end, slot_match);
+    }
 
     /* Reallocate with the new size. */
-    auto newsize = static_cast<size_t>(std::distance(newarray->begin(), slotiter));
-    if LIKELY(newsize != newarray->size())
+    auto newsize = static_cast<size_t>(std::distance(newarray->begin(), new_end));
+    if(newsize != newarray->size()) LIKELY
     {
         curarray = newarray;
-        newarray = ALeffectslot::CreatePtrArray(newsize);
+        newarray = EffectSlot::CreatePtrArray(newsize);
         std::copy_n(curarray->begin(), newsize, newarray->begin());
 
         delete curarray;
         curarray = nullptr;
     }
+    std::uninitialized_fill_n(newarray->end(), newsize, nullptr);
 
     curarray = context->mActiveAuxSlots.exchange(newarray, std::memory_order_acq_rel);
-    ALCdevice *device{context->mDevice.get()};
-    while((device->MixCount.load(std::memory_order_acquire)&1))
-        std::this_thread::yield();
+    context->mDevice->waitForMix();
+
+    al::destroy_n(curarray->end(), curarray->size());
     delete curarray;
 }
 
+
+EffectSlotType EffectSlotTypeFromEnum(ALenum type)
+{
+    switch(type)
+    {
+    case AL_EFFECT_NULL: return EffectSlotType::None;
+    case AL_EFFECT_REVERB: return EffectSlotType::Reverb;
+    case AL_EFFECT_CHORUS: return EffectSlotType::Chorus;
+    case AL_EFFECT_DISTORTION: return EffectSlotType::Distortion;
+    case AL_EFFECT_ECHO: return EffectSlotType::Echo;
+    case AL_EFFECT_FLANGER: return EffectSlotType::Flanger;
+    case AL_EFFECT_FREQUENCY_SHIFTER: return EffectSlotType::FrequencyShifter;
+    case AL_EFFECT_VOCAL_MORPHER: return EffectSlotType::VocalMorpher;
+    case AL_EFFECT_PITCH_SHIFTER: return EffectSlotType::PitchShifter;
+    case AL_EFFECT_RING_MODULATOR: return EffectSlotType::RingModulator;
+    case AL_EFFECT_AUTOWAH: return EffectSlotType::Autowah;
+    case AL_EFFECT_COMPRESSOR: return EffectSlotType::Compressor;
+    case AL_EFFECT_EQUALIZER: return EffectSlotType::Equalizer;
+    case AL_EFFECT_EAXREVERB: return EffectSlotType::EAXReverb;
+    case AL_EFFECT_DEDICATED_LOW_FREQUENCY_EFFECT: return EffectSlotType::DedicatedLFE;
+    case AL_EFFECT_DEDICATED_DIALOGUE: return EffectSlotType::DedicatedDialog;
+    case AL_EFFECT_CONVOLUTION_REVERB_SOFT: return EffectSlotType::Convolution;
+    }
+    ERR("Unhandled effect enum: 0x%04x\n", type);
+    return EffectSlotType::None;
+}
 
 bool EnsureEffectSlots(ALCcontext *context, size_t needed)
 {
     size_t count{std::accumulate(context->mEffectSlotList.cbegin(),
         context->mEffectSlotList.cend(), size_t{0},
         [](size_t cur, const EffectSlotSubList &sublist) noexcept -> size_t
-        { return cur + static_cast<ALuint>(POPCNT64(sublist.FreeMask)); }
-    )};
+        { return cur + static_cast<ALuint>(al::popcount(sublist.FreeMask)); })};
 
     while(needed > count)
     {
-        if UNLIKELY(context->mEffectSlotList.size() >= 1<<25)
+        if(context->mEffectSlotList.size() >= 1<<25) UNLIKELY
             return false;
 
         context->mEffectSlotList.emplace_back();
@@ -177,7 +252,7 @@ bool EnsureEffectSlots(ALCcontext *context, size_t needed)
         sublist->FreeMask = ~0_u64;
         sublist->EffectSlots = static_cast<ALeffectslot*>(
             al_calloc(alignof(ALeffectslot), sizeof(ALeffectslot)*64));
-        if UNLIKELY(!sublist->EffectSlots)
+        if(!sublist->EffectSlots) UNLIKELY
         {
             context->mEffectSlotList.pop_back();
             return false;
@@ -191,21 +266,15 @@ ALeffectslot *AllocEffectSlot(ALCcontext *context)
 {
     auto sublist = std::find_if(context->mEffectSlotList.begin(), context->mEffectSlotList.end(),
         [](const EffectSlotSubList &entry) noexcept -> bool
-        { return entry.FreeMask != 0; }
-    );
+        { return entry.FreeMask != 0; });
     auto lidx = static_cast<ALuint>(std::distance(context->mEffectSlotList.begin(), sublist));
-    auto slidx = static_cast<ALuint>(CTZ64(sublist->FreeMask));
+    auto slidx = static_cast<ALuint>(al::countr_zero(sublist->FreeMask));
+    ASSUME(slidx < 64);
 
-    ALeffectslot *slot{::new (sublist->EffectSlots + slidx) ALeffectslot{}};
-    if(ALenum err{InitEffectSlot(slot)})
-    {
-        al::destroy_at(slot);
-        context->setError(err, "Effect slot object initialization failed");
-        return nullptr;
-    }
-    aluInitEffectPanning(slot, context->mDevice.get());
+    ALeffectslot *slot{al::construct_at(sublist->EffectSlots + slidx, context)};
+    aluInitEffectPanning(slot->mSlot, context);
 
-    /* Add 1 to avoid source ID 0. */
+    /* Add 1 to avoid ID 0. */
     slot->id = ((lidx<<6) | slidx) + 1;
 
     context->mNumEffectSlots += 1;
@@ -227,37 +296,31 @@ void FreeEffectSlot(ALCcontext *context, ALeffectslot *slot)
 }
 
 
-#define DO_UPDATEPROPS() do {                                                 \
-    if(!context->mDeferUpdates.load(std::memory_order_acquire))               \
-        UpdateEffectSlotProps(slot, context.get());                           \
-    else                                                                      \
-        slot->PropsClean.clear(std::memory_order_release);                    \
-} while(0)
+inline void UpdateProps(ALeffectslot *slot, ALCcontext *context)
+{
+    if(!context->mDeferUpdates && slot->mState == SlotState::Playing)
+    {
+        slot->updateProps(context);
+        return;
+    }
+    slot->mPropsDirty = true;
+}
 
 } // namespace
 
-ALeffectslotArray *ALeffectslot::CreatePtrArray(size_t count) noexcept
-{
-    /* Allocate space for twice as many pointers, so the mixer has scratch
-     * space to store a sorted list during mixing.
-     */
-    void *ptr{al_calloc(alignof(ALeffectslotArray), ALeffectslotArray::Sizeof(count*2))};
-    return new (ptr) ALeffectslotArray{count};
-}
 
-
-AL_API ALvoid AL_APIENTRY alGenAuxiliaryEffectSlots(ALsizei n, ALuint *effectslots)
+AL_API void AL_APIENTRY alGenAuxiliaryEffectSlots(ALsizei n, ALuint *effectslots)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
-    if UNLIKELY(n < 0)
+    if(n < 0) UNLIKELY
         context->setError(AL_INVALID_VALUE, "Generating %d effect slots", n);
-    if UNLIKELY(n <= 0) return;
+    if(n <= 0) UNLIKELY return;
 
-    std::unique_lock<std::mutex> slotlock{context->mEffectSlotLock};
-    ALCdevice *device{context->mDevice.get()};
+    std::lock_guard<std::mutex> _{context->mEffectSlotLock};
+    ALCdevice *device{context->mALDevice.get()};
     if(static_cast<ALuint>(n) > device->AuxiliaryEffectSlotMax-context->mNumEffectSlots)
     {
         context->setError(AL_OUT_OF_MEMORY, "Exceeding %u effect slot limit (%u + %d)",
@@ -274,7 +337,6 @@ START_API_FUNC
     if(n == 1)
     {
         ALeffectslot *slot{AllocEffectSlot(context.get())};
-        if(!slot) return;
         effectslots[0] = slot->id;
     }
     else
@@ -284,59 +346,74 @@ START_API_FUNC
         ids.reserve(static_cast<ALuint>(count));
         do {
             ALeffectslot *slot{AllocEffectSlot(context.get())};
-            if(!slot)
-            {
-                slotlock.unlock();
-                alDeleteAuxiliaryEffectSlots(static_cast<ALsizei>(ids.size()), ids.data());
-                return;
-            }
             ids.emplace_back(slot->id);
         } while(--count);
         std::copy(ids.cbegin(), ids.cend(), effectslots);
     }
-
-    AddActiveEffectSlots(effectslots, static_cast<ALuint>(n), context.get());
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDeleteAuxiliaryEffectSlots(ALsizei n, const ALuint *effectslots)
+AL_API void AL_APIENTRY alDeleteAuxiliaryEffectSlots(ALsizei n, const ALuint *effectslots)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
-    if UNLIKELY(n < 0)
+    if(n < 0) UNLIKELY
         context->setError(AL_INVALID_VALUE, "Deleting %d effect slots", n);
-    if UNLIKELY(n <= 0) return;
+    if(n <= 0) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
-    auto validate_slot = [&context](const ALuint id) -> bool
+    if(n == 1)
     {
-        ALeffectslot *slot{LookupEffectSlot(context.get(), id)};
-        if UNLIKELY(!slot)
+        ALeffectslot *slot{LookupEffectSlot(context.get(), effectslots[0])};
+        if(!slot) UNLIKELY
         {
-            context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", id);
-            return false;
+            context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslots[0]);
+            return;
         }
-        if UNLIKELY(ReadRef(slot->ref) != 0)
+        if(ReadRef(slot->ref) != 0) UNLIKELY
         {
-            context->setError(AL_INVALID_OPERATION, "Deleting in-use effect slot %u", id);
-            return false;
+            context->setError(AL_INVALID_OPERATION, "Deleting in-use effect slot %u",
+                effectslots[0]);
+            return;
         }
-        return true;
-    };
-    auto effectslots_end = effectslots + n;
-    auto bad_slot = std::find_if_not(effectslots, effectslots_end, validate_slot);
-    if UNLIKELY(bad_slot != effectslots_end) return;
+        RemoveActiveEffectSlots({&slot, 1u}, context.get());
+        FreeEffectSlot(context.get(), slot);
+    }
+    else
+    {
+        auto slots = al::vector<ALeffectslot*>(static_cast<ALuint>(n));
+        for(size_t i{0};i < slots.size();++i)
+        {
+            ALeffectslot *slot{LookupEffectSlot(context.get(), effectslots[i])};
+            if(!slot) UNLIKELY
+            {
+                context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslots[i]);
+                return;
+            }
+            if(ReadRef(slot->ref) != 0) UNLIKELY
+            {
+                context->setError(AL_INVALID_OPERATION, "Deleting in-use effect slot %u",
+                    effectslots[i]);
+                return;
+            }
+            slots[i] = slot;
+        }
+        /* Remove any duplicates. */
+        auto slots_end = slots.end();
+        for(auto start=slots.begin()+1;start != slots_end;++start)
+        {
+            slots_end = std::remove(start, slots_end, *(start-1));
+            if(start == slots_end) break;
+        }
+        slots.erase(slots_end, slots.end());
 
-    // All effectslots are valid, remove and delete them
-    RemoveActiveEffectSlots(effectslots, static_cast<ALuint>(n), context.get());
-    auto delete_slot = [&context](const ALuint sid) -> void
-    {
-        ALeffectslot *slot{LookupEffectSlot(context.get(), sid)};
-        if(slot) FreeEffectSlot(context.get(), slot);
-    };
-    std::for_each(effectslots, effectslots_end, delete_slot);
+        /* All effectslots are valid, remove and delete them */
+        RemoveActiveEffectSlots(slots, context.get());
+        for(ALeffectslot *slot : slots)
+            FreeEffectSlot(context.get(), slot);
+    }
 }
 END_API_FUNC
 
@@ -344,7 +421,7 @@ AL_API ALboolean AL_APIENTRY alIsAuxiliaryEffectSlot(ALuint effectslot)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if LIKELY(context)
+    if(context) LIKELY
     {
         std::lock_guard<std::mutex> _{context->mEffectSlotLock};
         if(LookupEffectSlot(context.get(), effectslot) != nullptr)
@@ -355,17 +432,126 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alAuxiliaryEffectSloti(ALuint effectslot, ALenum param, ALint value)
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotPlaySOFT(ALuint slotid)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
+
+    std::lock_guard<std::mutex> _{context->mEffectSlotLock};
+    ALeffectslot *slot{LookupEffectSlot(context.get(), slotid)};
+    if(!slot) UNLIKELY
+    {
+        context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", slotid);
+        return;
+    }
+    if(slot->mState == SlotState::Playing)
+        return;
+
+    slot->mPropsDirty = false;
+    slot->updateProps(context.get());
+
+    AddActiveEffectSlots({&slot, 1}, context.get());
+    slot->mState = SlotState::Playing;
+}
+END_API_FUNC
+
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotPlayvSOFT(ALsizei n, const ALuint *slotids)
+START_API_FUNC
+{
+    ContextRef context{GetContextRef()};
+    if(!context) UNLIKELY return;
+
+    if(n < 0) UNLIKELY
+        context->setError(AL_INVALID_VALUE, "Playing %d effect slots", n);
+    if(n <= 0) UNLIKELY return;
+
+    auto slots = al::vector<ALeffectslot*>(static_cast<ALuint>(n));
+    std::lock_guard<std::mutex> _{context->mEffectSlotLock};
+    for(size_t i{0};i < slots.size();++i)
+    {
+        ALeffectslot *slot{LookupEffectSlot(context.get(), slotids[i])};
+        if(!slot) UNLIKELY
+        {
+            context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", slotids[i]);
+            return;
+        }
+
+        if(slot->mState != SlotState::Playing)
+        {
+            slot->mPropsDirty = false;
+            slot->updateProps(context.get());
+        }
+        slots[i] = slot;
+    };
+
+    AddActiveEffectSlots(slots, context.get());
+    for(auto slot : slots)
+        slot->mState = SlotState::Playing;
+}
+END_API_FUNC
+
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotStopSOFT(ALuint slotid)
+START_API_FUNC
+{
+    ContextRef context{GetContextRef()};
+    if(!context) UNLIKELY return;
+
+    std::lock_guard<std::mutex> _{context->mEffectSlotLock};
+    ALeffectslot *slot{LookupEffectSlot(context.get(), slotid)};
+    if(!slot) UNLIKELY
+    {
+        context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", slotid);
+        return;
+    }
+
+    RemoveActiveEffectSlots({&slot, 1}, context.get());
+    slot->mState = SlotState::Stopped;
+}
+END_API_FUNC
+
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotStopvSOFT(ALsizei n, const ALuint *slotids)
+START_API_FUNC
+{
+    ContextRef context{GetContextRef()};
+    if(!context) UNLIKELY return;
+
+    if(n < 0) UNLIKELY
+        context->setError(AL_INVALID_VALUE, "Stopping %d effect slots", n);
+    if(n <= 0) UNLIKELY return;
+
+    auto slots = al::vector<ALeffectslot*>(static_cast<ALuint>(n));
+    std::lock_guard<std::mutex> _{context->mEffectSlotLock};
+    for(size_t i{0};i < slots.size();++i)
+    {
+        ALeffectslot *slot{LookupEffectSlot(context.get(), slotids[i])};
+        if(!slot) UNLIKELY
+        {
+            context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", slotids[i]);
+            return;
+        }
+
+        slots[i] = slot;
+    };
+
+    RemoveActiveEffectSlots(slots, context.get());
+    for(auto slot : slots)
+        slot->mState = SlotState::Stopped;
+}
+END_API_FUNC
+
+
+AL_API void AL_APIENTRY alAuxiliaryEffectSloti(ALuint effectslot, ALenum param, ALint value)
+START_API_FUNC
+{
+    ContextRef context{GetContextRef()};
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     std::lock_guard<std::mutex> __{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     ALeffectslot *target{};
     ALCdevice *device{};
@@ -373,39 +559,58 @@ START_API_FUNC
     switch(param)
     {
     case AL_EFFECTSLOT_EFFECT:
-        device = context->mDevice.get();
+        device = context->mALDevice.get();
 
-        { std::lock_guard<std::mutex> ___{device->EffectLock};
+        {
+            std::lock_guard<std::mutex> ___{device->EffectLock};
             ALeffect *effect{value ? LookupEffect(device, static_cast<ALuint>(value)) : nullptr};
-            if(!(value == 0 || effect != nullptr))
-                SETERR_RETURN(context, AL_INVALID_VALUE,, "Invalid effect ID %u", value);
-            err = InitializeEffect(context.get(), slot, effect);
+            if(effect)
+                err = slot->initEffect(effect->type, effect->Props, context.get());
+            else
+            {
+                if(value != 0)
+                    return context->setError(AL_INVALID_VALUE, "Invalid effect ID %u", value);
+                err = slot->initEffect(AL_EFFECT_NULL, EffectProps{}, context.get());
+            }
         }
-        if(err != AL_NO_ERROR)
+        if(err != AL_NO_ERROR) UNLIKELY
         {
             context->setError(err, "Effect initialization failed");
+            return;
+        }
+        if(slot->mState == SlotState::Initial) UNLIKELY
+        {
+            slot->mPropsDirty = false;
+            slot->updateProps(context.get());
+
+            AddActiveEffectSlots({&slot, 1}, context.get());
+            slot->mState = SlotState::Playing;
             return;
         }
         break;
 
     case AL_EFFECTSLOT_AUXILIARY_SEND_AUTO:
         if(!(value == AL_TRUE || value == AL_FALSE))
-            SETERR_RETURN(context, AL_INVALID_VALUE,,
+            return context->setError(AL_INVALID_VALUE,
                 "Effect slot auxiliary send auto out of range");
-        slot->AuxSendAuto = static_cast<ALboolean>(value);
+        if(slot->AuxSendAuto == !!value) UNLIKELY
+            return;
+        slot->AuxSendAuto = !!value;
         break;
 
     case AL_EFFECTSLOT_TARGET_SOFT:
         target = LookupEffectSlot(context.get(), static_cast<ALuint>(value));
         if(value && !target)
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Invalid effect slot target ID");
+            return context->setError(AL_INVALID_VALUE, "Invalid effect slot target ID");
+        if(slot->Target == target) UNLIKELY
+            return;
         if(target)
         {
             ALeffectslot *checker{target};
             while(checker && checker != slot)
                 checker = checker->Target;
             if(checker)
-                SETERR_RETURN(context, AL_INVALID_OPERATION,,
+                return context->setError(AL_INVALID_OPERATION,
                     "Setting target of effect slot ID %u to %u creates circular chain", slot->id,
                     target->id);
         }
@@ -418,7 +623,7 @@ START_API_FUNC
             if(target) IncrementRef(target->ref);
             DecrementRef(oldtarget->ref);
             slot->Target = target;
-            UpdateEffectSlotProps(slot, context.get());
+            slot->updateProps(context.get());
             return;
         }
 
@@ -426,15 +631,57 @@ START_API_FUNC
         slot->Target = target;
         break;
 
+    case AL_BUFFER:
+        device = context->mALDevice.get();
+
+        if(slot->mState == SlotState::Playing)
+            return context->setError(AL_INVALID_OPERATION,
+                "Setting buffer on playing effect slot %u", slot->id);
+
+        if(ALbuffer *buffer{slot->Buffer})
+        {
+            if(buffer->id == static_cast<ALuint>(value)) UNLIKELY
+                return;
+        }
+        else if(value == 0) UNLIKELY
+            return;
+
+        {
+            std::lock_guard<std::mutex> ___{device->BufferLock};
+            ALbuffer *buffer{};
+            if(value)
+            {
+                buffer = LookupBuffer(device, static_cast<ALuint>(value));
+                if(!buffer) return context->setError(AL_INVALID_VALUE, "Invalid buffer ID");
+                if(buffer->mCallback)
+                    return context->setError(AL_INVALID_OPERATION,
+                        "Callback buffer not valid for effects");
+
+                IncrementRef(buffer->ref);
+            }
+
+            if(ALbuffer *oldbuffer{slot->Buffer})
+                DecrementRef(oldbuffer->ref);
+            slot->Buffer = buffer;
+
+            FPUCtl mixer_mode{};
+            auto *state = slot->Effect.State.get();
+            state->deviceUpdate(device, buffer);
+        }
+        break;
+
+    case AL_EFFECTSLOT_STATE_SOFT:
+        return context->setError(AL_INVALID_OPERATION, "AL_EFFECTSLOT_STATE_SOFT is read-only");
+
     default:
-        SETERR_RETURN(context, AL_INVALID_ENUM,, "Invalid effect slot integer property 0x%04x",
+        return context->setError(AL_INVALID_ENUM, "Invalid effect slot integer property 0x%04x",
             param);
     }
-    DO_UPDATEPROPS();
+    UpdateProps(slot, context.get());
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alAuxiliaryEffectSlotiv(ALuint effectslot, ALenum param, const ALint *values)
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotiv(ALuint effectslot, ALenum param, const ALint *values)
 START_API_FUNC
 {
     switch(param)
@@ -442,56 +689,60 @@ START_API_FUNC
     case AL_EFFECTSLOT_EFFECT:
     case AL_EFFECTSLOT_AUXILIARY_SEND_AUTO:
     case AL_EFFECTSLOT_TARGET_SOFT:
+    case AL_EFFECTSLOT_STATE_SOFT:
+    case AL_BUFFER:
         alAuxiliaryEffectSloti(effectslot, param, values[0]);
         return;
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
     default:
-        SETERR_RETURN(context, AL_INVALID_ENUM,,
+        return context->setError(AL_INVALID_ENUM,
             "Invalid effect slot integer-vector property 0x%04x", param);
     }
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alAuxiliaryEffectSlotf(ALuint effectslot, ALenum param, ALfloat value)
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotf(ALuint effectslot, ALenum param, ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     std::lock_guard<std::mutex> __{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
     case AL_EFFECTSLOT_GAIN:
         if(!(value >= 0.0f && value <= 1.0f))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Effect slot gain out of range");
+            return context->setError(AL_INVALID_VALUE, "Effect slot gain out of range");
+        if(slot->Gain == value) UNLIKELY
+            return;
         slot->Gain = value;
         break;
 
     default:
-        SETERR_RETURN(context, AL_INVALID_ENUM,, "Invalid effect slot float property 0x%04x",
+        return context->setError(AL_INVALID_ENUM, "Invalid effect slot float property 0x%04x",
             param);
     }
-    DO_UPDATEPROPS();
+    UpdateProps(slot, context.get());
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alAuxiliaryEffectSlotfv(ALuint effectslot, ALenum param, const ALfloat *values)
+AL_API void AL_APIENTRY alAuxiliaryEffectSlotfv(ALuint effectslot, ALenum param, const ALfloat *values)
 START_API_FUNC
 {
     switch(param)
@@ -502,43 +753,54 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
     default:
-        SETERR_RETURN(context, AL_INVALID_ENUM,,
+        return context->setError(AL_INVALID_ENUM,
             "Invalid effect slot float-vector property 0x%04x", param);
     }
 }
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alGetAuxiliaryEffectSloti(ALuint effectslot, ALenum param, ALint *value)
+AL_API void AL_APIENTRY alGetAuxiliaryEffectSloti(ALuint effectslot, ALenum param, ALint *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
     case AL_EFFECTSLOT_AUXILIARY_SEND_AUTO:
-        *value = slot->AuxSendAuto;
+        *value = slot->AuxSendAuto ? AL_TRUE : AL_FALSE;
         break;
 
     case AL_EFFECTSLOT_TARGET_SOFT:
         if(auto *target = slot->Target)
             *value = static_cast<ALint>(target->id);
+        else
+            *value = 0;
+        break;
+
+    case AL_EFFECTSLOT_STATE_SOFT:
+        *value = static_cast<int>(slot->mState);
+        break;
+
+    case AL_BUFFER:
+        if(auto *buffer = slot->Buffer)
+            *value = static_cast<ALint>(buffer->id);
         else
             *value = 0;
         break;
@@ -549,7 +811,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetAuxiliaryEffectSlotiv(ALuint effectslot, ALenum param, ALint *values)
+AL_API void AL_APIENTRY alGetAuxiliaryEffectSlotiv(ALuint effectslot, ALenum param, ALint *values)
 START_API_FUNC
 {
     switch(param)
@@ -557,17 +819,19 @@ START_API_FUNC
     case AL_EFFECTSLOT_EFFECT:
     case AL_EFFECTSLOT_AUXILIARY_SEND_AUTO:
     case AL_EFFECTSLOT_TARGET_SOFT:
+    case AL_EFFECTSLOT_STATE_SOFT:
+    case AL_BUFFER:
         alGetAuxiliaryEffectSloti(effectslot, param, values);
         return;
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
@@ -578,16 +842,16 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetAuxiliaryEffectSlotf(ALuint effectslot, ALenum param, ALfloat *value)
+AL_API void AL_APIENTRY alGetAuxiliaryEffectSlotf(ALuint effectslot, ALenum param, ALfloat *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
@@ -601,7 +865,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetAuxiliaryEffectSlotfv(ALuint effectslot, ALenum param, ALfloat *values)
+AL_API void AL_APIENTRY alGetAuxiliaryEffectSlotfv(ALuint effectslot, ALenum param, ALfloat *values)
 START_API_FUNC
 {
     switch(param)
@@ -612,12 +876,12 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
     ALeffectslot *slot = LookupEffectSlot(context.get(), effectslot);
-    if UNLIKELY(!slot)
-        SETERR_RETURN(context, AL_INVALID_NAME,, "Invalid effect slot ID %u", effectslot);
+    if(!slot) UNLIKELY
+        return context->setError(AL_INVALID_NAME, "Invalid effect slot ID %u", effectslot);
 
     switch(param)
     {
@@ -629,74 +893,17 @@ START_API_FUNC
 END_API_FUNC
 
 
-ALenum InitializeEffect(ALCcontext *Context, ALeffectslot *EffectSlot, ALeffect *effect)
+ALeffectslot::ALeffectslot(ALCcontext *context)
 {
-    ALenum newtype{effect ? effect->type : AL_EFFECT_NULL};
-    if(newtype != EffectSlot->Effect.Type)
-    {
-        EffectStateFactory *factory{getFactoryByType(newtype)};
-        if(!factory)
-        {
-            ERR("Failed to find factory for effect type 0x%04x\n", newtype);
-            return AL_INVALID_ENUM;
-        }
-        EffectState *State{factory->create()};
-        if(!State) return AL_OUT_OF_MEMORY;
+    EffectStateFactory *factory{getFactoryByType(EffectSlotType::None)};
+    if(!factory) throw std::runtime_error{"Failed to get null effect factory"};
 
-        FPUCtl mixer_mode{};
-        ALCdevice *Device{Context->mDevice.get()};
-        std::unique_lock<std::mutex> statelock{Device->StateLock};
-        State->mOutTarget = Device->Dry.Buffer;
-        if(State->deviceUpdate(Device) == AL_FALSE)
-        {
-            statelock.unlock();
-            mixer_mode.leave();
-            State->release();
-            return AL_OUT_OF_MEMORY;
-        }
-        mixer_mode.leave();
+    al::intrusive_ptr<EffectState> state{factory->create()};
+    Effect.State = state;
 
-        if(!effect)
-        {
-            EffectSlot->Effect.Type = AL_EFFECT_NULL;
-            EffectSlot->Effect.Props = EffectProps {};
-        }
-        else
-        {
-            EffectSlot->Effect.Type = effect->type;
-            EffectSlot->Effect.Props = effect->Props;
-        }
-
-        EffectSlot->Effect.State->release();
-        EffectSlot->Effect.State = State;
-    }
-    else if(effect)
-        EffectSlot->Effect.Props = effect->Props;
-
-    /* Remove state references from old effect slot property updates. */
-    ALeffectslotProps *props{Context->mFreeEffectslotProps.load()};
-    while(props)
-    {
-        if(props->State)
-            props->State->release();
-        props->State = nullptr;
-        props = props->next.load(std::memory_order_relaxed);
-    }
-
-    return AL_NO_ERROR;
-}
-
-
-ALenum InitEffectSlot(ALeffectslot *slot)
-{
-    EffectStateFactory *factory{getFactoryByType(slot->Effect.Type)};
-    if(!factory) return AL_INVALID_VALUE;
-    slot->Effect.State = factory->create();
-    if(!slot->Effect.State) return AL_OUT_OF_MEMORY;
-
-    slot->Effect.State->add_ref();
-    slot->Params.mEffectState = slot->Effect.State;
-    return AL_NO_ERROR;
+    mSlot = context->getEffectSlot();
+    mSlot->InUse = true;
+    mSlot->mEffectState = std::move(state);
 }
 
 ALeffectslot::~ALeffectslot()
@@ -704,31 +911,71 @@ ALeffectslot::~ALeffectslot()
     if(Target)
         DecrementRef(Target->ref);
     Target = nullptr;
+    if(Buffer)
+        DecrementRef(Buffer->ref);
+    Buffer = nullptr;
 
-    ALeffectslotProps *props{Params.Update.load()};
-    if(props)
+    if(EffectSlotProps *props{mSlot->Update.exchange(nullptr)})
     {
-        if(props->State) props->State->release();
         TRACE("Freed unapplied AuxiliaryEffectSlot update %p\n",
             decltype(std::declval<void*>()){props});
         delete props;
     }
 
-    if(Effect.State)
-        Effect.State->release();
-    if(Params.mEffectState)
-        Params.mEffectState->release();
+    mSlot->mEffectState = nullptr;
+    mSlot->InUse = false;
 }
 
-void UpdateEffectSlotProps(ALeffectslot *slot, ALCcontext *context)
+ALenum ALeffectslot::initEffect(ALenum effectType, const EffectProps &effectProps,
+    ALCcontext *context)
+{
+    EffectSlotType newtype{EffectSlotTypeFromEnum(effectType)};
+    if(newtype != Effect.Type)
+    {
+        EffectStateFactory *factory{getFactoryByType(newtype)};
+        if(!factory)
+        {
+            ERR("Failed to find factory for effect slot type %d\n", static_cast<int>(newtype));
+            return AL_INVALID_ENUM;
+        }
+        al::intrusive_ptr<EffectState> state{factory->create()};
+
+        ALCdevice *device{context->mALDevice.get()};
+        std::unique_lock<std::mutex> statelock{device->StateLock};
+        state->mOutTarget = device->Dry.Buffer;
+        {
+            FPUCtl mixer_mode{};
+            state->deviceUpdate(device, Buffer);
+        }
+
+        Effect.Type = newtype;
+        Effect.Props = effectProps;
+
+        Effect.State = std::move(state);
+    }
+    else if(newtype != EffectSlotType::None)
+        Effect.Props = effectProps;
+
+    /* Remove state references from old effect slot property updates. */
+    EffectSlotProps *props{context->mFreeEffectslotProps.load()};
+    while(props)
+    {
+        props->State = nullptr;
+        props = props->next.load(std::memory_order_relaxed);
+    }
+
+    return AL_NO_ERROR;
+}
+
+void ALeffectslot::updateProps(ALCcontext *context)
 {
     /* Get an unused property container, or allocate a new one as needed. */
-    ALeffectslotProps *props{context->mFreeEffectslotProps.load(std::memory_order_relaxed)};
+    EffectSlotProps *props{context->mFreeEffectslotProps.load(std::memory_order_relaxed)};
     if(!props)
-        props = new ALeffectslotProps{};
+        props = new EffectSlotProps{};
     else
     {
-        ALeffectslotProps *next;
+        EffectSlotProps *next;
         do {
             next = props->next.load(std::memory_order_relaxed);
         } while(context->mFreeEffectslotProps.compare_exchange_weak(props, next,
@@ -736,44 +983,41 @@ void UpdateEffectSlotProps(ALeffectslot *slot, ALCcontext *context)
     }
 
     /* Copy in current property values. */
-    props->Gain = slot->Gain;
-    props->AuxSendAuto = slot->AuxSendAuto;
-    props->Target = slot->Target;
+    props->Gain = Gain;
+    props->AuxSendAuto = AuxSendAuto;
+    props->Target = Target ? Target->mSlot : nullptr;
 
-    props->Type = slot->Effect.Type;
-    props->Props = slot->Effect.Props;
-    /* Swap out any stale effect state object there may be in the container, to
-     * delete it.
-     */
-    EffectState *oldstate{props->State};
-    slot->Effect.State->add_ref();
-    props->State = slot->Effect.State;
+    props->Type = Effect.Type;
+    props->Props = Effect.Props;
+    props->State = Effect.State;
 
     /* Set the new container for updating internal parameters. */
-    props = slot->Params.Update.exchange(props, std::memory_order_acq_rel);
+    props = mSlot->Update.exchange(props, std::memory_order_acq_rel);
     if(props)
     {
         /* If there was an unused update container, put it back in the
          * freelist.
          */
-        if(props->State)
-            props->State->release();
         props->State = nullptr;
         AtomicReplaceHead(context->mFreeEffectslotProps, props);
     }
-
-    if(oldstate)
-        oldstate->release();
 }
 
 void UpdateAllEffectSlotProps(ALCcontext *context)
 {
     std::lock_guard<std::mutex> _{context->mEffectSlotLock};
-    ALeffectslotArray *auxslots{context->mActiveAuxSlots.load(std::memory_order_acquire)};
-    for(ALeffectslot *slot : *auxslots)
+    for(auto &sublist : context->mEffectSlotList)
     {
-        if(!slot->PropsClean.test_and_set(std::memory_order_acq_rel))
-            UpdateEffectSlotProps(slot, context);
+        uint64_t usemask{~sublist.FreeMask};
+        while(usemask)
+        {
+            const int idx{al::countr_zero(usemask)};
+            usemask &= ~(1_u64 << idx);
+            ALeffectslot *slot{sublist.EffectSlots + idx};
+
+            if(slot->mState != SlotState::Stopped && std::exchange(slot->mPropsDirty, false))
+                slot->updateProps(context);
+        }
     }
 }
 
@@ -782,7 +1026,7 @@ EffectSlotSubList::~EffectSlotSubList()
     uint64_t usemask{~FreeMask};
     while(usemask)
     {
-        ALsizei idx{CTZ64(usemask)};
+        const int idx{al::countr_zero(usemask)};
         al::destroy_at(EffectSlots+idx);
         usemask &= ~(1_u64 << idx);
     }
@@ -790,3 +1034,530 @@ EffectSlotSubList::~EffectSlotSubList()
     al_free(EffectSlots);
     EffectSlots = nullptr;
 }
+
+#ifdef ALSOFT_EAX
+void ALeffectslot::eax_initialize(ALCcontext& al_context, EaxFxSlotIndexValue index)
+{
+    if(index >= EAX_MAX_FXSLOTS)
+        eax_fail("Index out of range.");
+
+    eax_al_context_ = &al_context;
+    eax_fx_slot_index_ = index;
+    eax_fx_slot_set_defaults();
+
+    eax_effect_ = std::make_unique<EaxEffect>();
+    if(index == 0) eax_effect_->init<EaxReverbCommitter>();
+    else if(index == 1) eax_effect_->init<EaxChorusCommitter>();
+    else eax_effect_->init<EaxNullCommitter>();
+}
+
+void ALeffectslot::eax_commit()
+{
+    if(eax_df_ != EaxDirtyFlags{})
+    {
+        auto df = EaxDirtyFlags{};
+        switch(eax_version_)
+        {
+        case 1:
+        case 2:
+        case 3:
+            eax5_fx_slot_commit(eax123_, df);
+            break;
+        case 4:
+            eax4_fx_slot_commit(df);
+            break;
+        case 5:
+            eax5_fx_slot_commit(eax5_, df);
+            break;
+        }
+        eax_df_ = EaxDirtyFlags{};
+
+        if((df & eax_volume_dirty_bit) != EaxDirtyFlags{})
+            eax_fx_slot_set_volume();
+        if((df & eax_flags_dirty_bit) != EaxDirtyFlags{})
+            eax_fx_slot_set_flags();
+    }
+
+    if(eax_effect_->commit(eax_version_))
+        eax_set_efx_slot_effect(*eax_effect_);
+}
+
+[[noreturn]] void ALeffectslot::eax_fail(const char* message)
+{
+    throw Exception{message};
+}
+
+[[noreturn]] void ALeffectslot::eax_fail_unknown_effect_id()
+{
+    eax_fail("Unknown effect ID.");
+}
+
+[[noreturn]] void ALeffectslot::eax_fail_unknown_property_id()
+{
+    eax_fail("Unknown property ID.");
+}
+
+[[noreturn]] void ALeffectslot::eax_fail_unknown_version()
+{
+    eax_fail("Unknown version.");
+}
+
+void ALeffectslot::eax4_fx_slot_ensure_unlocked() const
+{
+    if(eax4_fx_slot_is_legacy())
+        eax_fail("Locked legacy slot.");
+}
+
+ALenum ALeffectslot::eax_get_efx_effect_type(const GUID& guid)
+{
+    if(guid == EAX_NULL_GUID)
+        return AL_EFFECT_NULL;
+    if(guid == EAX_AUTOWAH_EFFECT)
+        return AL_EFFECT_AUTOWAH;
+    if(guid == EAX_CHORUS_EFFECT)
+        return AL_EFFECT_CHORUS;
+    if(guid == EAX_AGCCOMPRESSOR_EFFECT)
+        return AL_EFFECT_COMPRESSOR;
+    if(guid == EAX_DISTORTION_EFFECT)
+        return AL_EFFECT_DISTORTION;
+    if(guid == EAX_REVERB_EFFECT)
+        return AL_EFFECT_EAXREVERB;
+    if(guid == EAX_ECHO_EFFECT)
+        return AL_EFFECT_ECHO;
+    if(guid == EAX_EQUALIZER_EFFECT)
+        return AL_EFFECT_EQUALIZER;
+    if(guid == EAX_FLANGER_EFFECT)
+        return AL_EFFECT_FLANGER;
+    if(guid == EAX_FREQUENCYSHIFTER_EFFECT)
+        return AL_EFFECT_FREQUENCY_SHIFTER;
+    if(guid == EAX_PITCHSHIFTER_EFFECT)
+        return AL_EFFECT_PITCH_SHIFTER;
+    if(guid == EAX_RINGMODULATOR_EFFECT)
+        return AL_EFFECT_RING_MODULATOR;
+    if(guid == EAX_VOCALMORPHER_EFFECT)
+        return AL_EFFECT_VOCAL_MORPHER;
+
+    eax_fail_unknown_effect_id();
+}
+
+const GUID& ALeffectslot::eax_get_eax_default_effect_guid() const noexcept
+{
+    switch(eax_fx_slot_index_)
+    {
+    case 0: return EAX_REVERB_EFFECT;
+    case 1: return EAX_CHORUS_EFFECT;
+    default: return EAX_NULL_GUID;
+    }
+}
+
+long ALeffectslot::eax_get_eax_default_lock() const noexcept
+{
+    return eax4_fx_slot_is_legacy() ? EAXFXSLOT_LOCKED : EAXFXSLOT_UNLOCKED;
+}
+
+void ALeffectslot::eax4_fx_slot_set_defaults(Eax4Props& props) noexcept
+{
+    props.guidLoadEffect = eax_get_eax_default_effect_guid();
+    props.lVolume = EAXFXSLOT_DEFAULTVOLUME;
+    props.lLock = eax_get_eax_default_lock();
+    props.ulFlags = EAX40FXSLOT_DEFAULTFLAGS;
+}
+
+void ALeffectslot::eax5_fx_slot_set_defaults(Eax5Props& props) noexcept
+{
+    props.guidLoadEffect = eax_get_eax_default_effect_guid();
+    props.lVolume = EAXFXSLOT_DEFAULTVOLUME;
+    props.lLock = EAXFXSLOT_UNLOCKED;
+    props.ulFlags = EAX50FXSLOT_DEFAULTFLAGS;
+    props.lOcclusion = EAXFXSLOT_DEFAULTOCCLUSION;
+    props.flOcclusionLFRatio = EAXFXSLOT_DEFAULTOCCLUSIONLFRATIO;
+}
+
+void ALeffectslot::eax_fx_slot_set_defaults()
+{
+    eax5_fx_slot_set_defaults(eax123_.i);
+    eax4_fx_slot_set_defaults(eax4_.i);
+    eax5_fx_slot_set_defaults(eax5_.i);
+    eax_ = eax5_.i;
+    eax_df_ = EaxDirtyFlags{};
+}
+
+void ALeffectslot::eax4_fx_slot_get(const EaxCall& call, const Eax4Props& props) const
+{
+    switch(call.get_property_id())
+    {
+    case EAXFXSLOT_ALLPARAMETERS:
+        call.set_value<Exception>(props);
+        break;
+    case EAXFXSLOT_LOADEFFECT:
+        call.set_value<Exception>(props.guidLoadEffect);
+        break;
+    case EAXFXSLOT_VOLUME:
+        call.set_value<Exception>(props.lVolume);
+        break;
+    case EAXFXSLOT_LOCK:
+        call.set_value<Exception>(props.lLock);
+        break;
+    case EAXFXSLOT_FLAGS:
+        call.set_value<Exception>(props.ulFlags);
+        break;
+    default:
+        eax_fail_unknown_property_id();
+    }
+}
+
+void ALeffectslot::eax5_fx_slot_get(const EaxCall& call, const Eax5Props& props) const
+{
+    switch(call.get_property_id())
+    {
+    case EAXFXSLOT_ALLPARAMETERS:
+        call.set_value<Exception>(props);
+        break;
+    case EAXFXSLOT_LOADEFFECT:
+        call.set_value<Exception>(props.guidLoadEffect);
+        break;
+    case EAXFXSLOT_VOLUME:
+        call.set_value<Exception>(props.lVolume);
+        break;
+    case EAXFXSLOT_LOCK:
+        call.set_value<Exception>(props.lLock);
+        break;
+    case EAXFXSLOT_FLAGS:
+        call.set_value<Exception>(props.ulFlags);
+        break;
+    case EAXFXSLOT_OCCLUSION:
+        call.set_value<Exception>(props.lOcclusion);
+        break;
+    case EAXFXSLOT_OCCLUSIONLFRATIO:
+        call.set_value<Exception>(props.flOcclusionLFRatio);
+        break;
+    default:
+        eax_fail_unknown_property_id();
+    }
+}
+
+void ALeffectslot::eax_fx_slot_get(const EaxCall& call) const
+{
+    switch(call.get_version())
+    {
+    case 4: eax4_fx_slot_get(call, eax4_.i); break;
+    case 5: eax5_fx_slot_get(call, eax5_.i); break;
+    default: eax_fail_unknown_version();
+    }
+}
+
+bool ALeffectslot::eax_get(const EaxCall& call)
+{
+    switch(call.get_property_set_id())
+    {
+    case EaxCallPropertySetId::fx_slot:
+        eax_fx_slot_get(call);
+        break;
+    case EaxCallPropertySetId::fx_slot_effect:
+        eax_effect_->get(call);
+        break;
+    default:
+        eax_fail_unknown_property_id();
+    }
+
+    return false;
+}
+
+void ALeffectslot::eax_fx_slot_load_effect(int version, ALenum altype)
+{
+    if(!IsValidEffectType(altype))
+        altype = AL_EFFECT_NULL;
+    eax_effect_->set_defaults(version, altype);
+}
+
+void ALeffectslot::eax_fx_slot_set_volume()
+{
+    const auto volume = clamp(eax_.lVolume, EAXFXSLOT_MINVOLUME, EAXFXSLOT_MAXVOLUME);
+    const auto gain = level_mb_to_gain(static_cast<float>(volume));
+    eax_set_efx_slot_gain(gain);
+}
+
+void ALeffectslot::eax_fx_slot_set_environment_flag()
+{
+    eax_set_efx_slot_send_auto((eax_.ulFlags & EAXFXSLOTFLAGS_ENVIRONMENT) != 0u);
+}
+
+void ALeffectslot::eax_fx_slot_set_flags()
+{
+    eax_fx_slot_set_environment_flag();
+}
+
+void ALeffectslot::eax4_fx_slot_set_all(const EaxCall& call)
+{
+    eax4_fx_slot_ensure_unlocked();
+    const auto& src = call.get_value<Exception, const EAX40FXSLOTPROPERTIES>();
+    Eax4AllValidator{}(src);
+    auto& dst = eax4_.i;
+    eax_df_ |= eax_load_effect_dirty_bit; // Always reset the effect.
+    eax_df_ |= (dst.lVolume != src.lVolume ? eax_volume_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.lLock != src.lLock ? eax_lock_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.ulFlags != src.ulFlags ? eax_flags_dirty_bit : EaxDirtyFlags{});
+    dst = src;
+}
+
+void ALeffectslot::eax5_fx_slot_set_all(const EaxCall& call)
+{
+    const auto& src = call.get_value<Exception, const EAX50FXSLOTPROPERTIES>();
+    Eax5AllValidator{}(src);
+    auto& dst = eax5_.i;
+    eax_df_ |= eax_load_effect_dirty_bit; // Always reset the effect.
+    eax_df_ |= (dst.lVolume != src.lVolume ? eax_volume_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.lLock != src.lLock ? eax_lock_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.ulFlags != src.ulFlags ? eax_flags_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.lOcclusion != src.lOcclusion ? eax_flags_dirty_bit : EaxDirtyFlags{});
+    eax_df_ |= (dst.flOcclusionLFRatio != src.flOcclusionLFRatio ? eax_flags_dirty_bit : EaxDirtyFlags{});
+    dst = src;
+}
+
+bool ALeffectslot::eax_fx_slot_should_update_sources() const noexcept
+{
+    const auto dirty_bits =
+        eax_occlusion_dirty_bit |
+        eax_occlusion_lf_ratio_dirty_bit |
+        eax_flags_dirty_bit;
+
+    if((eax_df_ & dirty_bits) != EaxDirtyFlags{})
+        return true;
+
+    return false;
+}
+
+// Returns `true` if all sources should be updated, or `false` otherwise.
+bool ALeffectslot::eax4_fx_slot_set(const EaxCall& call)
+{
+    auto& dst = eax4_.i;
+
+    switch(call.get_property_id())
+    {
+    case EAXFXSLOT_NONE:
+        break;
+    case EAXFXSLOT_ALLPARAMETERS:
+        eax4_fx_slot_set_all(call);
+        if((eax_df_ & eax_load_effect_dirty_bit))
+            eax_fx_slot_load_effect(4, eax_get_efx_effect_type(dst.guidLoadEffect));
+        break;
+    case EAXFXSLOT_LOADEFFECT:
+        eax4_fx_slot_ensure_unlocked();
+        eax_fx_slot_set_dirty<Eax4GuidLoadEffectValidator, eax_load_effect_dirty_bit>(call, dst.guidLoadEffect, eax_df_);
+        if((eax_df_ & eax_load_effect_dirty_bit))
+            eax_fx_slot_load_effect(4, eax_get_efx_effect_type(dst.guidLoadEffect));
+        break;
+    case EAXFXSLOT_VOLUME:
+        eax_fx_slot_set<Eax4VolumeValidator, eax_volume_dirty_bit>(call, dst.lVolume, eax_df_);
+        break;
+    case EAXFXSLOT_LOCK:
+        eax4_fx_slot_ensure_unlocked();
+        eax_fx_slot_set<Eax4LockValidator, eax_lock_dirty_bit>(call, dst.lLock, eax_df_);
+        break;
+    case EAXFXSLOT_FLAGS:
+        eax_fx_slot_set<Eax4FlagsValidator, eax_flags_dirty_bit>(call, dst.ulFlags, eax_df_);
+        break;
+    default:
+        eax_fail_unknown_property_id();
+    }
+
+    return eax_fx_slot_should_update_sources();
+}
+
+// Returns `true` if all sources should be updated, or `false` otherwise.
+bool ALeffectslot::eax5_fx_slot_set(const EaxCall& call)
+{
+    auto& dst = eax5_.i;
+
+    switch(call.get_property_id())
+    {
+    case EAXFXSLOT_NONE:
+        break;
+    case EAXFXSLOT_ALLPARAMETERS:
+        eax5_fx_slot_set_all(call);
+        if((eax_df_ & eax_load_effect_dirty_bit))
+            eax_fx_slot_load_effect(5, eax_get_efx_effect_type(dst.guidLoadEffect));
+        break;
+    case EAXFXSLOT_LOADEFFECT:
+        eax_fx_slot_set_dirty<Eax4GuidLoadEffectValidator, eax_load_effect_dirty_bit>(call, dst.guidLoadEffect, eax_df_);
+        if((eax_df_ & eax_load_effect_dirty_bit))
+            eax_fx_slot_load_effect(5, eax_get_efx_effect_type(dst.guidLoadEffect));
+        break;
+    case EAXFXSLOT_VOLUME:
+        eax_fx_slot_set<Eax4VolumeValidator, eax_volume_dirty_bit>(call, dst.lVolume, eax_df_);
+        break;
+    case EAXFXSLOT_LOCK:
+        eax_fx_slot_set<Eax4LockValidator, eax_lock_dirty_bit>(call, dst.lLock, eax_df_);
+        break;
+    case EAXFXSLOT_FLAGS:
+        eax_fx_slot_set<Eax5FlagsValidator, eax_flags_dirty_bit>(call, dst.ulFlags, eax_df_);
+        break;
+    case EAXFXSLOT_OCCLUSION:
+        eax_fx_slot_set<Eax5OcclusionValidator, eax_occlusion_dirty_bit>(call, dst.lOcclusion, eax_df_);
+        break;
+    case EAXFXSLOT_OCCLUSIONLFRATIO:
+        eax_fx_slot_set<Eax5OcclusionLfRatioValidator, eax_occlusion_lf_ratio_dirty_bit>(call, dst.flOcclusionLFRatio, eax_df_);
+        break;
+    default:
+        eax_fail_unknown_property_id();
+    }
+
+    return eax_fx_slot_should_update_sources();
+}
+
+// Returns `true` if all sources should be updated, or `false` otherwise.
+bool ALeffectslot::eax_fx_slot_set(const EaxCall& call)
+{
+    switch (call.get_version())
+    {
+    case 4: return eax4_fx_slot_set(call);
+    case 5: return eax5_fx_slot_set(call);
+    default: eax_fail_unknown_version();
+    }
+}
+
+// Returns `true` if all sources should be updated, or `false` otherwise.
+bool ALeffectslot::eax_set(const EaxCall& call)
+{
+    bool ret{false};
+
+    switch(call.get_property_set_id())
+    {
+    case EaxCallPropertySetId::fx_slot: ret = eax_fx_slot_set(call); break;
+    case EaxCallPropertySetId::fx_slot_effect: eax_effect_->set(call); break;
+    default: eax_fail_unknown_property_id();
+    }
+
+    const auto version = call.get_version();
+    if(eax_version_ != version)
+        eax_df_ = ~EaxDirtyFlags{};
+    eax_version_ = version;
+
+    return ret;
+}
+
+void ALeffectslot::eax4_fx_slot_commit(EaxDirtyFlags& dst_df)
+{
+    eax_fx_slot_commit_property<eax_load_effect_dirty_bit>(eax4_, dst_df, &EAX40FXSLOTPROPERTIES::guidLoadEffect);
+    eax_fx_slot_commit_property<eax_volume_dirty_bit>(eax4_, dst_df, &EAX40FXSLOTPROPERTIES::lVolume);
+    eax_fx_slot_commit_property<eax_lock_dirty_bit>(eax4_, dst_df, &EAX40FXSLOTPROPERTIES::lLock);
+    eax_fx_slot_commit_property<eax_flags_dirty_bit>(eax4_, dst_df, &EAX40FXSLOTPROPERTIES::ulFlags);
+
+    auto& dst_i = eax_;
+
+    if(dst_i.lOcclusion != EAXFXSLOT_DEFAULTOCCLUSION) {
+        dst_df |= eax_occlusion_dirty_bit;
+        dst_i.lOcclusion = EAXFXSLOT_DEFAULTOCCLUSION;
+    }
+
+    if(dst_i.flOcclusionLFRatio != EAXFXSLOT_DEFAULTOCCLUSIONLFRATIO) {
+        dst_df |= eax_occlusion_lf_ratio_dirty_bit;
+        dst_i.flOcclusionLFRatio = EAXFXSLOT_DEFAULTOCCLUSIONLFRATIO;
+    }
+}
+
+void ALeffectslot::eax5_fx_slot_commit(Eax5State& state, EaxDirtyFlags& dst_df)
+{
+    eax_fx_slot_commit_property<eax_load_effect_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::guidLoadEffect);
+    eax_fx_slot_commit_property<eax_volume_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::lVolume);
+    eax_fx_slot_commit_property<eax_lock_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::lLock);
+    eax_fx_slot_commit_property<eax_flags_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::ulFlags);
+    eax_fx_slot_commit_property<eax_occlusion_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::lOcclusion);
+    eax_fx_slot_commit_property<eax_occlusion_lf_ratio_dirty_bit>(state, dst_df, &EAX50FXSLOTPROPERTIES::flOcclusionLFRatio);
+}
+
+void ALeffectslot::eax_set_efx_slot_effect(EaxEffect &effect)
+{
+#define EAX_PREFIX "[EAX_SET_EFFECT_SLOT_EFFECT] "
+
+    const auto error = initEffect(effect.al_effect_type_, effect.al_effect_props_, eax_al_context_);
+
+    if(error != AL_NO_ERROR) {
+        ERR(EAX_PREFIX "%s\n", "Failed to initialize an effect.");
+        return;
+    }
+
+    if(mState == SlotState::Initial) {
+        mPropsDirty = false;
+        updateProps(eax_al_context_);
+        auto effect_slot_ptr = this;
+        AddActiveEffectSlots({&effect_slot_ptr, 1}, eax_al_context_);
+        mState = SlotState::Playing;
+        return;
+    }
+
+    mPropsDirty = true;
+
+#undef EAX_PREFIX
+}
+
+void ALeffectslot::eax_set_efx_slot_send_auto(bool is_send_auto)
+{
+    if(AuxSendAuto == is_send_auto)
+        return;
+
+    AuxSendAuto = is_send_auto;
+    mPropsDirty = true;
+}
+
+void ALeffectslot::eax_set_efx_slot_gain(ALfloat gain)
+{
+#define EAX_PREFIX "[EAX_SET_EFFECT_SLOT_GAIN] "
+
+    if(gain == Gain)
+        return;
+    if(gain < 0.0f || gain > 1.0f)
+        ERR(EAX_PREFIX "Gain out of range (%f)\n", gain);
+
+    Gain = clampf(gain, 0.0f, 1.0f);
+    mPropsDirty = true;
+
+#undef EAX_PREFIX
+}
+
+void ALeffectslot::EaxDeleter::operator()(ALeffectslot* effect_slot)
+{
+    assert(effect_slot);
+    eax_delete_al_effect_slot(*effect_slot->eax_al_context_, *effect_slot);
+}
+
+EaxAlEffectSlotUPtr eax_create_al_effect_slot(ALCcontext& context)
+{
+#define EAX_PREFIX "[EAX_MAKE_EFFECT_SLOT] "
+
+    std::unique_lock<std::mutex> effect_slot_lock{context.mEffectSlotLock};
+    auto& device = *context.mALDevice;
+
+    if(context.mNumEffectSlots == device.AuxiliaryEffectSlotMax) {
+        ERR(EAX_PREFIX "%s\n", "Out of memory.");
+        return nullptr;
+    }
+
+    if(!EnsureEffectSlots(&context, 1)) {
+        ERR(EAX_PREFIX "%s\n", "Failed to ensure.");
+        return nullptr;
+    }
+
+    return EaxAlEffectSlotUPtr{AllocEffectSlot(&context)};
+
+#undef EAX_PREFIX
+}
+
+void eax_delete_al_effect_slot(ALCcontext& context, ALeffectslot& effect_slot)
+{
+#define EAX_PREFIX "[EAX_DELETE_EFFECT_SLOT] "
+
+    std::lock_guard<std::mutex> effect_slot_lock{context.mEffectSlotLock};
+
+    if(ReadRef(effect_slot.ref) != 0) {
+        ERR(EAX_PREFIX "Deleting in-use effect slot %u.\n", effect_slot.id);
+        return;
+    }
+
+    auto effect_slot_ptr = &effect_slot;
+    RemoveActiveEffectSlots({&effect_slot_ptr, 1}, &context);
+    FreeEffectSlot(&context, &effect_slot);
+
+#undef EAX_PREFIX
+}
+#endif // ALSOFT_EAX

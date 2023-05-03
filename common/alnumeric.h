@@ -1,6 +1,8 @@
 #ifndef AL_NUMERIC_H
 #define AL_NUMERIC_H
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #ifdef HAVE_INTRIN_H
@@ -10,6 +12,7 @@
 #include <xmmintrin.h>
 #endif
 
+#include "altraits.h"
 #include "opthelpers.h"
 
 
@@ -67,6 +70,19 @@ constexpr inline size_t clampz(size_t val, size_t min, size_t max) noexcept
 { return minz(max, maxz(min, val)); }
 
 
+constexpr inline float lerpf(float val1, float val2, float mu) noexcept
+{ return val1 + (val2-val1)*mu; }
+constexpr inline float cubic(float val1, float val2, float val3, float val4, float mu) noexcept
+{
+    const float mu2{mu*mu}, mu3{mu2*mu};
+    const float a0{-0.5f*mu3 +       mu2 + -0.5f*mu};
+    const float a1{ 1.5f*mu3 + -2.5f*mu2            + 1.0f};
+    const float a2{-1.5f*mu3 +  2.0f*mu2 +  0.5f*mu};
+    const float a3{ 0.5f*mu3 + -0.5f*mu2};
+    return val1*a0 + val2*a1 + val3*a2 + val4*a3;
+}
+
+
 /** Find the next power-of-2 for non-power-of-2 numbers. */
 inline uint32_t NextPowerOf2(uint32_t value) noexcept
 {
@@ -82,105 +98,20 @@ inline uint32_t NextPowerOf2(uint32_t value) noexcept
     return value+1;
 }
 
-/** Round up a value to the next multiple. */
-inline size_t RoundUp(size_t value, size_t r) noexcept
-{
-    value += r-1;
-    return value - (value%r);
-}
-
-
-/* Define CTZ macros (count trailing zeros), and POPCNT macros (population
- * count/count 1 bits), for 32- and 64-bit integers. The CTZ macros' results
- * are *UNDEFINED* if the value is 0.
+/**
+ * If the value is not already a multiple of r, round down to the next
+ * multiple.
  */
-#ifdef __GNUC__
+template<typename T>
+constexpr T RoundDown(T value, al::type_identity_t<T> r) noexcept
+{ return value - (value%r); }
 
-#define POPCNT32 __builtin_popcount
-#define CTZ32 __builtin_ctz
-#if SIZEOF_LONG == 8
-#define POPCNT64 __builtin_popcountl
-#define CTZ64 __builtin_ctzl
-#else
-#define POPCNT64 __builtin_popcountll
-#define CTZ64 __builtin_ctzll
-#endif
-
-#else
-
-/* There be black magics here. The popcnt method is derived from
- * https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
- * while the ctz-utilizing-popcnt algorithm is shown here
- * http://www.hackersdelight.org/hdcodetxt/ntz.c.txt
- * as the ntz2 variant. These likely aren't the most efficient methods, but
- * they're good enough if the GCC built-ins aren't available.
+/**
+ * If the value is not already a multiple of r, round up to the next multiple.
  */
-inline int fallback_popcnt32(uint32_t v)
-{
-    v = v - ((v >> 1) & 0x55555555u);
-    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
-    v = (v + (v >> 4)) & 0x0f0f0f0fu;
-    return (int)((v * 0x01010101u) >> 24);
-}
-#define POPCNT32 fallback_popcnt32
-inline int fallback_popcnt64(uint64_t v)
-{
-    v = v - ((v >> 1) & 0x5555555555555555_u64);
-    v = (v & 0x3333333333333333_u64) + ((v >> 2) & 0x3333333333333333_u64);
-    v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f_u64;
-    return (int)((v * 0x0101010101010101_u64) >> 56);
-}
-#define POPCNT64 fallback_popcnt64
-
-#if defined(HAVE_BITSCANFORWARD64_INTRINSIC)
-
-inline int msvc64_ctz32(uint32_t v)
-{
-    unsigned long idx = 32;
-    _BitScanForward(&idx, v);
-    return (int)idx;
-}
-#define CTZ32 msvc64_ctz32
-inline int msvc64_ctz64(uint64_t v)
-{
-    unsigned long idx = 64;
-    _BitScanForward64(&idx, v);
-    return (int)idx;
-}
-#define CTZ64 msvc64_ctz64
-
-#elif defined(HAVE_BITSCANFORWARD_INTRINSIC)
-
-inline int msvc_ctz32(uint32_t v)
-{
-    unsigned long idx = 32;
-    _BitScanForward(&idx, v);
-    return (int)idx;
-}
-#define CTZ32 msvc_ctz32
-inline int msvc_ctz64(uint64_t v)
-{
-    unsigned long idx = 64;
-    if(!_BitScanForward(&idx, (uint32_t)(v&0xffffffff)))
-    {
-        if(_BitScanForward(&idx, (uint32_t)(v>>32)))
-            idx += 32;
-    }
-    return (int)idx;
-}
-#define CTZ64 msvc_ctz64
-
-#else
-
-inline int fallback_ctz32(uint32_t value)
-{ return POPCNT32(~value & (value - 1)); }
-#define CTZ32 fallback_ctz32
-inline int fallback_ctz64(uint64_t value)
-{ return POPCNT64(~value & (value - 1)); }
-#define CTZ64 fallback_ctz64
-
-#endif
-#endif
+template<typename T>
+constexpr T RoundUp(T value, al::type_identity_t<T> r) noexcept
+{ return RoundDown(value + r-1, r); }
 
 
 /**
@@ -225,8 +156,9 @@ inline int float2int(float f) noexcept
 #if defined(HAVE_SSE_INTRINSICS)
     return _mm_cvtt_ss2si(_mm_set_ss(f));
 
-#elif ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-       !defined(__SSE_MATH__)) || (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP == 0)
+#elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP == 0) \
+    || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+        && !defined(__SSE_MATH__))
     int sign, shift, mant;
     union {
         float f;
@@ -238,11 +170,11 @@ inline int float2int(float f) noexcept
     shift = ((conv.i>>23)&0xff) - (127+23);
 
     /* Over/underflow */
-    if UNLIKELY(shift >= 31 || shift < -23)
+    if(shift >= 31 || shift < -23) UNLIKELY
         return 0;
 
     mant = (conv.i&0x7fffff) | 0x800000;
-    if LIKELY(shift < 0)
+    if(shift < 0) LIKELY
         return (mant >> -shift) * sign;
     return (mant << shift) * sign;
 
@@ -260,9 +192,9 @@ inline int double2int(double d) noexcept
 #if defined(HAVE_SSE_INTRINSICS)
     return _mm_cvttsd_si32(_mm_set_sd(d));
 
-#elif ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-       !defined(__SSE2_MATH__)) || (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP < 2)
-
+#elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP < 2) \
+    || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+        && !defined(__SSE2_MATH__))
     int sign, shift;
     int64_t mant;
     union {
@@ -275,11 +207,11 @@ inline int double2int(double d) noexcept
     shift = ((conv.i64 >> 52) & 0x7ff) - (1023 + 52);
 
     /* Over/underflow */
-    if UNLIKELY(shift >= 63 || shift < -52)
+    if(shift >= 63 || shift < -52) UNLIKELY
         return 0;
 
     mant = (conv.i64 & 0xfffffffffffff_i64) | 0x10000000000000_i64;
-    if LIKELY(shift < 0)
+    if(shift < 0) LIKELY
         return (int)(mant >> -shift) * sign;
     return (int)(mant << shift) * sign;
 
@@ -296,11 +228,17 @@ inline int double2int(double d) noexcept
  */
 inline float fast_roundf(float f) noexcept
 {
-#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-    !defined(__SSE_MATH__)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+    && !defined(__SSE_MATH__)
 
     float out;
     __asm__ __volatile__("frndint" : "=t"(out) : "0"(f));
+    return out;
+
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+
+    float out;
+    __asm__ volatile("frintx %s0, %s1" : "=w"(out) : "w"(f));
     return out;
 
 #else
@@ -322,7 +260,7 @@ inline float fast_roundf(float f) noexcept
     sign = (conv.i>>31)&0x01;
     expo = (conv.i>>23)&0xff;
 
-    if UNLIKELY(expo >= 150/*+23*/)
+    if(expo >= 150/*+23*/) UNLIKELY
     {
         /* An exponent (base-2) of 23 or higher is incapable of sub-integral
          * precision, so it's already an integral value. We don't need to worry
@@ -342,6 +280,29 @@ inline float fast_roundf(float f) noexcept
     f += ilim[sign];
     return f - ilim[sign];
 #endif
+}
+
+
+template<typename T>
+constexpr const T& clamp(const T& value, const T& min_value, const T& max_value) noexcept
+{
+    return std::min(std::max(value, min_value), max_value);
+}
+
+// Converts level (mB) to gain.
+inline float level_mb_to_gain(float x)
+{
+    if(x <= -10'000.0f)
+        return 0.0f;
+    return std::pow(10.0f, x / 2'000.0f);
+}
+
+// Converts gain to level (mB).
+inline float gain_to_level_mb(float x)
+{
+    if (x <= 0.0f)
+        return -10'000.0f;
+    return maxf(std::log10(x) * 2'000.0f, -10'000.0f);
 }
 
 #endif /* AL_NUMERIC_H */

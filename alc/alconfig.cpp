@@ -18,14 +18,6 @@
  * Or go to http://www.gnu.org/copyleft/lgpl.html
  */
 
-#ifdef _WIN32
-#ifdef __MINGW32__
-#define _WIN32_IE 0x501
-#else
-#define _WIN32_IE 0x400
-#endif
-#endif
-
 #include "config.h"
 
 #include "alconfig.h"
@@ -33,7 +25,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
-#ifdef _WIN32_IE
+#ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
 #endif
@@ -48,8 +40,8 @@
 
 #include "alfstream.h"
 #include "alstring.h"
-#include "compat.h"
-#include "logging.h"
+#include "core/helpers.h"
+#include "core/logging.h"
 #include "strutils.h"
 #include "vector.h"
 
@@ -148,7 +140,7 @@ void LoadConfigFromFile(std::istream &f)
 
         if(buffer[0] == '[')
         {
-            char *line{&buffer[0]};
+            auto line = const_cast<char*>(buffer.data());
             char *section = line+1;
             char *endsection;
 
@@ -224,35 +216,28 @@ void LoadConfigFromFile(std::istream &f)
             continue;
         }
 
-        auto cmtpos = buffer.find('#');
-        if(cmtpos != std::string::npos)
-            buffer.resize(cmtpos);
-        while(!buffer.empty() && std::isspace(buffer.back()))
-            buffer.pop_back();
-        if(buffer.empty()) continue;
+        auto cmtpos = std::min(buffer.find('#'), buffer.size());
+        while(cmtpos > 0 && std::isspace(buffer[cmtpos-1]))
+            --cmtpos;
+        if(!cmtpos) continue;
+        buffer.erase(cmtpos);
 
-        const char *line{&buffer[0]};
-        char key[256]{};
-        char value[256]{};
-        if(std::sscanf(line, "%255[^=] = \"%255[^\"]\"", key, value) == 2 ||
-           std::sscanf(line, "%255[^=] = '%255[^\']'", key, value) == 2 ||
-           std::sscanf(line, "%255[^=] = %255[^\n]", key, value) == 2)
+        auto sep = buffer.find('=');
+        if(sep == std::string::npos)
         {
-            /* sscanf doesn't handle '' or "" as empty values, so clip it
-             * manually. */
-            if(std::strcmp(value, "\"\"") == 0 || std::strcmp(value, "''") == 0)
-                value[0] = 0;
-        }
-        else if(std::sscanf(line, "%255[^=] %255[=]", key, value) == 2)
-        {
-            /* Special case for 'key =' */
-            value[0] = 0;
-        }
-        else
-        {
-            ERR(" config parse error: malformed option line: \"%s\"\n\n", line);
+            ERR(" config parse error: malformed option line: \"%s\"\n", buffer.c_str());
             continue;
         }
+        auto keyend = sep++;
+        while(keyend > 0 && std::isspace(buffer[keyend-1]))
+            --keyend;
+        if(!keyend)
+        {
+            ERR(" config parse error: malformed option line: \"%s\"\n", buffer.c_str());
+            continue;
+        }
+        while(sep < buffer.size() && std::isspace(buffer[sep]))
+            sep++;
 
         std::string fullKey;
         if(!curSection.empty())
@@ -260,28 +245,82 @@ void LoadConfigFromFile(std::istream &f)
             fullKey += curSection;
             fullKey += '/';
         }
-        fullKey += key;
-        while(!fullKey.empty() && std::isspace(fullKey.back()))
-            fullKey.pop_back();
+        fullKey += buffer.substr(0u, keyend);
 
-        TRACE(" found '%s' = '%s'\n", fullKey.c_str(), value);
+        std::string value{(sep < buffer.size()) ? buffer.substr(sep) : std::string{}};
+        if(value.size() > 1)
+        {
+            if((value.front() == '"' && value.back() == '"')
+                || (value.front() == '\'' && value.back() == '\''))
+            {
+                value.pop_back();
+                value.erase(value.begin());
+            }
+        }
+
+        TRACE(" found '%s' = '%s'\n", fullKey.c_str(), value.c_str());
 
         /* Check if we already have this option set */
-        auto ent = std::find_if(ConfOpts.begin(), ConfOpts.end(),
-            [&fullKey](const ConfigEntry &entry) -> bool
-            { return entry.key == fullKey; }
-        );
+        auto find_key = [&fullKey](const ConfigEntry &entry) -> bool
+        { return entry.key == fullKey; };
+        auto ent = std::find_if(ConfOpts.begin(), ConfOpts.end(), find_key);
         if(ent != ConfOpts.end())
         {
-            if(value[0])
-                ent->value = expdup(value);
+            if(!value.empty())
+                ent->value = expdup(value.c_str());
             else
                 ConfOpts.erase(ent);
         }
-        else if(value[0])
-            ConfOpts.emplace_back(ConfigEntry{std::move(fullKey), expdup(value)});
+        else if(!value.empty())
+            ConfOpts.emplace_back(ConfigEntry{std::move(fullKey), expdup(value.c_str())});
     }
     ConfOpts.shrink_to_fit();
+}
+
+const char *GetConfigValue(const char *devName, const char *blockName, const char *keyName)
+{
+    if(!keyName)
+        return nullptr;
+
+    std::string key;
+    if(blockName && al::strcasecmp(blockName, "general") != 0)
+    {
+        key = blockName;
+        if(devName)
+        {
+            key += '/';
+            key += devName;
+        }
+        key += '/';
+        key += keyName;
+    }
+    else
+    {
+        if(devName)
+        {
+            key = devName;
+            key += '/';
+        }
+        key += keyName;
+    }
+
+    auto iter = std::find_if(ConfOpts.cbegin(), ConfOpts.cend(),
+        [&key](const ConfigEntry &entry) -> bool
+        { return entry.key == key; });
+    if(iter != ConfOpts.cend())
+    {
+        TRACE("Found %s = \"%s\"\n", key.c_str(), iter->value.c_str());
+        if(!iter->value.empty())
+            return iter->value.c_str();
+        return nullptr;
+    }
+
+    if(!devName)
+    {
+        TRACE("Key %s not found\n", key.c_str());
+        return nullptr;
+    }
+    return GetConfigValue(nullptr, blockName, keyName);
 }
 
 } // namespace
@@ -444,106 +483,46 @@ void ReadALConfig()
 }
 #endif
 
-const char *GetConfigValue(const char *devName, const char *blockName, const char *keyName, const char *def)
-{
-    if(!keyName)
-        return def;
-
-    std::string key;
-    if(blockName && al::strcasecmp(blockName, "general") != 0)
-    {
-        key = blockName;
-        if(devName)
-        {
-            key += '/';
-            key += devName;
-        }
-        key += '/';
-        key += keyName;
-    }
-    else
-    {
-        if(devName)
-        {
-            key = devName;
-            key += '/';
-        }
-        key += keyName;
-    }
-
-    auto iter = std::find_if(ConfOpts.cbegin(), ConfOpts.cend(),
-        [&key](const ConfigEntry &entry) -> bool
-        { return entry.key == key; }
-    );
-    if(iter != ConfOpts.cend())
-    {
-        TRACE("Found %s = \"%s\"\n", key.c_str(), iter->value.c_str());
-        if(!iter->value.empty())
-            return iter->value.c_str();
-        return def;
-    }
-
-    if(!devName)
-    {
-        TRACE("Key %s not found\n", key.c_str());
-        return def;
-    }
-    return GetConfigValue(nullptr, blockName, keyName, def);
-}
-
-int ConfigValueExists(const char *devName, const char *blockName, const char *keyName)
-{
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    return val[0] != 0;
-}
-
 al::optional<std::string> ConfigValueStr(const char *devName, const char *blockName, const char *keyName)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    if(!val[0]) return al::nullopt;
-
-    return al::make_optional<std::string>(val);
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return val;
+    return al::nullopt;
 }
 
 al::optional<int> ConfigValueInt(const char *devName, const char *blockName, const char *keyName)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    if(!val[0]) return al::nullopt;
-
-    return al::make_optional(static_cast<int>(std::strtol(val, nullptr, 0)));
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return static_cast<int>(std::strtol(val, nullptr, 0));
+    return al::nullopt;
 }
 
 al::optional<unsigned int> ConfigValueUInt(const char *devName, const char *blockName, const char *keyName)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    if(!val[0]) return al::nullopt;
-
-    return al::make_optional(static_cast<unsigned int>(std::strtoul(val, nullptr, 0)));
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return static_cast<unsigned int>(std::strtoul(val, nullptr, 0));
+    return al::nullopt;
 }
 
 al::optional<float> ConfigValueFloat(const char *devName, const char *blockName, const char *keyName)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    if(!val[0]) return al::nullopt;
-
-    return al::make_optional(std::strtof(val, nullptr));
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return std::strtof(val, nullptr);
+    return al::nullopt;
 }
 
 al::optional<bool> ConfigValueBool(const char *devName, const char *blockName, const char *keyName)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-    if(!val[0]) return al::nullopt;
-
-    return al::make_optional(
-        al::strcasecmp(val, "true") == 0 || al::strcasecmp(val, "yes") == 0 ||
-        al::strcasecmp(val, "on") == 0 || atoi(val) != 0);
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return al::strcasecmp(val, "on") == 0 || al::strcasecmp(val, "yes") == 0
+            || al::strcasecmp(val, "true")==0 || atoi(val) != 0;
+    return al::nullopt;
 }
 
-int GetConfigValueBool(const char *devName, const char *blockName, const char *keyName, int def)
+bool GetConfigValueBool(const char *devName, const char *blockName, const char *keyName, bool def)
 {
-    const char *val = GetConfigValue(devName, blockName, keyName, "");
-
-    if(!val[0]) return def != 0;
-    return (al::strcasecmp(val, "true") == 0 || al::strcasecmp(val, "yes") == 0 ||
-            al::strcasecmp(val, "on") == 0 || atoi(val) != 0);
+    if(const char *val{GetConfigValue(devName, blockName, keyName)})
+        return (al::strcasecmp(val, "on") == 0 || al::strcasecmp(val, "yes") == 0
+            || al::strcasecmp(val, "true") == 0 || atoi(val) != 0);
+    return def;
 }

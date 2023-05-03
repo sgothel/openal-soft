@@ -29,26 +29,50 @@
 #include "AL/alc.h"
 #include "AL/efx.h"
 
-#include "alcontext.h"
-#include "alexcpt.h"
+#include "alc/context.h"
 #include "almalloc.h"
 #include "atomic.h"
+#include "core/except.h"
 #include "opthelpers.h"
 
 
-#define DO_UPDATEPROPS() do {                                                 \
-    if(!context->mDeferUpdates.load(std::memory_order_acquire))               \
-        UpdateListenerProps(context.get());                                   \
-    else                                                                      \
-        listener.PropsClean.clear(std::memory_order_release);                 \
-} while(0)
+namespace {
 
+inline void UpdateProps(ALCcontext *context)
+{
+    if(!context->mDeferUpdates)
+    {
+        UpdateContextProps(context);
+        return;
+    }
+    context->mPropsDirty = true;
+}
 
-AL_API ALvoid AL_APIENTRY alListenerf(ALenum param, ALfloat value)
+inline void CommitAndUpdateProps(ALCcontext *context)
+{
+    if(!context->mDeferUpdates)
+    {
+#ifdef ALSOFT_EAX
+        if(context->eaxNeedsCommit())
+        {
+            context->mPropsDirty = true;
+            context->applyAllUpdates();
+            return;
+        }
+#endif
+        UpdateContextProps(context);
+        return;
+    }
+    context->mPropsDirty = true;
+}
+
+} // namespace
+
+AL_API void AL_APIENTRY alListenerf(ALenum param, ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -56,16 +80,16 @@ START_API_FUNC
     {
     case AL_GAIN:
         if(!(value >= 0.0f && std::isfinite(value)))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Listener gain out of range");
+            return context->setError(AL_INVALID_VALUE, "Listener gain out of range");
         listener.Gain = value;
-        DO_UPDATEPROPS();
+        UpdateProps(context.get());
         break;
 
     case AL_METERS_PER_UNIT:
         if(!(value >= AL_MIN_METERS_PER_UNIT && value <= AL_MAX_METERS_PER_UNIT))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Listener meters per unit out of range");
+            return context->setError(AL_INVALID_VALUE, "Listener meters per unit out of range");
         listener.mMetersPerUnit = value;
-        DO_UPDATEPROPS();
+        UpdateProps(context.get());
         break;
 
     default:
@@ -74,11 +98,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alListener3f(ALenum param, ALfloat value1, ALfloat value2, ALfloat value3)
+AL_API void AL_APIENTRY alListener3f(ALenum param, ALfloat value1, ALfloat value2, ALfloat value3)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -86,20 +110,20 @@ START_API_FUNC
     {
     case AL_POSITION:
         if(!(std::isfinite(value1) && std::isfinite(value2) && std::isfinite(value3)))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Listener position out of range");
+            return context->setError(AL_INVALID_VALUE, "Listener position out of range");
         listener.Position[0] = value1;
         listener.Position[1] = value2;
         listener.Position[2] = value3;
-        DO_UPDATEPROPS();
+        CommitAndUpdateProps(context.get());
         break;
 
     case AL_VELOCITY:
         if(!(std::isfinite(value1) && std::isfinite(value2) && std::isfinite(value3)))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Listener velocity out of range");
+            return context->setError(AL_INVALID_VALUE, "Listener velocity out of range");
         listener.Velocity[0] = value1;
         listener.Velocity[1] = value2;
         listener.Velocity[2] = value3;
-        DO_UPDATEPROPS();
+        CommitAndUpdateProps(context.get());
         break;
 
     default:
@@ -108,7 +132,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alListenerfv(ALenum param, const ALfloat *values)
+AL_API void AL_APIENTRY alListenerfv(ALenum param, const ALfloat *values)
 START_API_FUNC
 {
     if(values)
@@ -128,17 +152,19 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
+
+    if(!values) UNLIKELY
+        return context->setError(AL_INVALID_VALUE, "NULL pointer");
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
-    if(!values) SETERR_RETURN(context, AL_INVALID_VALUE,, "NULL pointer");
     switch(param)
     {
     case AL_ORIENTATION:
         if(!(std::isfinite(values[0]) && std::isfinite(values[1]) && std::isfinite(values[2]) &&
              std::isfinite(values[3]) && std::isfinite(values[4]) && std::isfinite(values[5])))
-            SETERR_RETURN(context, AL_INVALID_VALUE,, "Listener orientation out of range");
+            return context->setError(AL_INVALID_VALUE, "Listener orientation out of range");
         /* AT then UP */
         listener.OrientAt[0] = values[0];
         listener.OrientAt[1] = values[1];
@@ -146,7 +172,7 @@ START_API_FUNC
         listener.OrientUp[0] = values[3];
         listener.OrientUp[1] = values[4];
         listener.OrientUp[2] = values[5];
-        DO_UPDATEPROPS();
+        CommitAndUpdateProps(context.get());
         break;
 
     default:
@@ -156,11 +182,11 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alListeneri(ALenum param, ALint /*value*/)
+AL_API void AL_APIENTRY alListeneri(ALenum param, ALint /*value*/)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     switch(param)
@@ -178,12 +204,13 @@ START_API_FUNC
     {
     case AL_POSITION:
     case AL_VELOCITY:
-        alListener3f(param, static_cast<ALfloat>(value1), static_cast<ALfloat>(value2), static_cast<ALfloat>(value3));
+        alListener3f(param, static_cast<ALfloat>(value1), static_cast<ALfloat>(value2),
+            static_cast<ALfloat>(value3));
         return;
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     switch(param)
@@ -204,7 +231,8 @@ START_API_FUNC
         {
         case AL_POSITION:
         case AL_VELOCITY:
-            alListener3f(param, static_cast<ALfloat>(values[0]), static_cast<ALfloat>(values[1]), static_cast<ALfloat>(values[2]));
+            alListener3f(param, static_cast<ALfloat>(values[0]), static_cast<ALfloat>(values[1]),
+                static_cast<ALfloat>(values[2]));
             return;
 
         case AL_ORIENTATION:
@@ -220,10 +248,10 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
-    if(!values)
+    if(!values) UNLIKELY
         context->setError(AL_INVALID_VALUE, "NULL pointer");
     else switch(param)
     {
@@ -234,11 +262,11 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alGetListenerf(ALenum param, ALfloat *value)
+AL_API void AL_APIENTRY alGetListenerf(ALenum param, ALfloat *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -260,11 +288,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetListener3f(ALenum param, ALfloat *value1, ALfloat *value2, ALfloat *value3)
+AL_API void AL_APIENTRY alGetListener3f(ALenum param, ALfloat *value1, ALfloat *value2, ALfloat *value3)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -290,7 +318,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetListenerfv(ALenum param, ALfloat *values)
+AL_API void AL_APIENTRY alGetListenerfv(ALenum param, ALfloat *values)
 START_API_FUNC
 {
     switch(param)
@@ -307,7 +335,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -332,11 +360,11 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alGetListeneri(ALenum param, ALint *value)
+AL_API void AL_APIENTRY alGetListeneri(ALenum param, ALint *value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     std::lock_guard<std::mutex> _{context->mPropLock};
     if(!value)
@@ -353,7 +381,7 @@ AL_API void AL_APIENTRY alGetListener3i(ALenum param, ALint *value1, ALint *valu
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -391,7 +419,7 @@ START_API_FUNC
     }
 
     ContextRef context{GetContextRef()};
-    if UNLIKELY(!context) return;
+    if(!context) UNLIKELY return;
 
     ALlistener &listener = context->mListener;
     std::lock_guard<std::mutex> _{context->mPropLock};
@@ -414,39 +442,3 @@ START_API_FUNC
     }
 }
 END_API_FUNC
-
-
-void UpdateListenerProps(ALCcontext *context)
-{
-    /* Get an unused proprty container, or allocate a new one as needed. */
-    ALlistenerProps *props{context->mFreeListenerProps.load(std::memory_order_acquire)};
-    if(!props)
-        props = new ALlistenerProps{};
-    else
-    {
-        ALlistenerProps *next;
-        do {
-            next = props->next.load(std::memory_order_relaxed);
-        } while(context->mFreeListenerProps.compare_exchange_weak(props, next,
-                std::memory_order_seq_cst, std::memory_order_acquire) == 0);
-    }
-
-    /* Copy in current property values. */
-    ALlistener &listener = context->mListener;
-    props->Position = listener.Position;
-    props->Velocity = listener.Velocity;
-    props->OrientAt = listener.OrientAt;
-    props->OrientUp = listener.OrientUp;
-    props->Gain = listener.Gain;
-    props->MetersPerUnit = listener.mMetersPerUnit;
-
-    /* Set the new container for updating internal parameters. */
-    props = listener.Params.Update.exchange(props, std::memory_order_acq_rel);
-    if(props)
-    {
-        /* If there was an unused update container, put it back in the
-         * freelist.
-         */
-        AtomicReplaceHead(context->mFreeListenerProps, props);
-    }
-}
