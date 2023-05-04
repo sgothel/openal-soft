@@ -1279,6 +1279,8 @@ if(ALSOFT_UTILS OR ALSOFT_EXAMPLES)
     endif()
 endif()
 
+ENDIF() # (NOT CMAKE_CROSSCOMPILING)
+
 if(NOT WIN32)
     set(LIBNAME "openal")
 else()
