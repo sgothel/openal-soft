@@ -11,6 +11,12 @@ SET(CMAKE_SYSTEM_NAME Windows)
 SET(CMAKE_C_COMPILER "gcc.exe")
 SET(CMAKE_CXX_COMPILER "g++.exe")
 
+set(LINKER_FLAGS "-static -static-libgcc -static-libstdc++")
+
+set(CMAKE_SHARED_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
+set(CMAKE_MODULE_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
+set(CMAKE_EXE_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
+
 # here is the target environment located
 #SET(CMAKE_FIND_ROOT_PATH "/usr/${HOST}")
 
