@@ -6,14 +6,20 @@ if(NOT APPLE)
 endif()
 
 if(APPLE)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=10.5")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=10.5")
+    # was 10.5, but `-stdlib=libc++` requires >= 10.7 (deployment target)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=10.7")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=10.7")
 endif()
 
 # inject additional architectures for fat-binary (macosx)
 # CMAKE_EXTRA_ARCHS is set from JOAL's ant build.xml
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_EXTRA_ARCHS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_EXTRA_ARCHS}")
+if(NOT APPLE)
+    set(CC_XTRA_FLAGS "")
+else()
+    set(CC_XTRA_FLAGS "-stdlib=libc++")
+endif()
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CC_XTRA_FLAGS} ${CMAKE_EXTRA_ARCHS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CC_XTRA_FLAGS} ${CMAKE_EXTRA_ARCHS}")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}" CACHE STRING "c flags")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" CACHE STRING "c++ flags")
@@ -23,10 +29,16 @@ message(STATUS "CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
 message(STATUS "CMAKE_C_FLAGS  : ${CMAKE_C_FLAGS}")
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 
-set(LINKER_FLAGS "-static-libgcc -static-libstdc++")
+if(NOT APPLE)
+    set(LINKER_FLAGS "-static-libgcc -static-libstdc++")
+else()
+    set(LINKER_FLAGS "-stdlib=libc++ -lc++abi")
+endif()
 message(STATUS "LINKER_FLAGS: ${LINKER_FLAGS}")
 
 set(CMAKE_SHARED_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
 set(CMAKE_MODULE_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
 set(CMAKE_EXE_LINKER_FLAGS "${LINKER_FLAGS}" CACHE STRING "linker flags" FORCE)
+
+set(CMAKE_CXX_COMPILER "clang++")
 
