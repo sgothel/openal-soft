@@ -7,8 +7,12 @@ endif()
 
 if(APPLE)
     # was 10.5, but `-stdlib=libc++` requires >= 10.7 (deployment target)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=10.7")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=10.7")
+    # OpenAL-Soft git version 2023-11-25 requires >= 10.13
+    # Note:
+    # - kAudioObjectPropertyElementMain   since macOS 12
+    # - kAudioObjectPropertyElementMaster gone in macOS 12
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=10.13 -DkAudioObjectPropertyElementMain=kAudioObjectPropertyElementMaster")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=10.13 -DkAudioObjectPropertyElementMain=kAudioObjectPropertyElementMaster")
 endif()
 
 # inject additional architectures for fat-binary (macosx)
