@@ -177,7 +177,7 @@ std::vector<std::string> SearchDataFiles(const char *ext, const char *subdir)
     return results;
 }
 
-void SetRTPriority(void)
+void SetRTPriority()
 {
 #if !defined(ALSOFT_UWP)
     if(RTPrioLevel > 0)
@@ -256,7 +256,7 @@ const PathNamePair &GetProcBinary()
 #ifndef __SWITCH__
     if(pathname.empty())
     {
-        const char *SelfLinkNames[]{
+        std::array SelfLinkNames{
             "/proc/self/exe",
             "/proc/self/file",
             "/proc/curproc/exe",

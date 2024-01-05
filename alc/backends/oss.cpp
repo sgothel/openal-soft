@@ -79,7 +79,9 @@
 
 namespace {
 
+/* NOLINTNEXTLINE(*-avoid-c-arrays) */
 constexpr char DefaultName[] = "OSS Default";
+
 std::string DefaultPlayback{"/dev/dsp"};
 std::string DefaultCapture{"/dev/dsp"};
 
@@ -238,8 +240,6 @@ struct OSSPlayback final : public BackendBase {
 
     std::atomic<bool> mKillNow{true};
     std::thread mThread;
-
-    DEF_NEWDEL(OSSPlayback)
 };
 
 OSSPlayback::~OSSPlayback()
@@ -367,11 +367,9 @@ bool OSSPlayback::reset()
     uint numFragmentsLogSize{(periods << 16) | log2FragmentSize};
 
     audio_buf_info info{};
-    const char *err;
-#define CHECKERR(func) if((func) < 0) {                                       \
-    err = #func;                                                              \
-    goto err;                                                                 \
-}
+#define CHECKERR(func) if((func) < 0)                                         \
+    throw al::backend_exception{al::backend_error::DeviceError, "%s failed: %s\n", #func, strerror(errno)};
+
     /* Don't fail if SETFRAGMENT fails. We can handle just about anything
      * that's reported back via GETOSPACE */
     ioctl(mFd, SNDCTL_DSP_SETFRAGMENT, &numFragmentsLogSize);
@@ -379,12 +377,6 @@ bool OSSPlayback::reset()
     CHECKERR(ioctl(mFd, SNDCTL_DSP_CHANNELS, &numChannels));
     CHECKERR(ioctl(mFd, SNDCTL_DSP_SPEED, &ossSpeed));
     CHECKERR(ioctl(mFd, SNDCTL_DSP_GETOSPACE, &info));
-    if(0)
-    {
-    err:
-        ERR("%s failed: %s\n", err, strerror(errno));
-        return false;
-    }
 #undef CHECKERR
 
     if(mDevice->channelsFromFmt() != numChannels)
@@ -409,7 +401,7 @@ bool OSSPlayback::reset()
 
     setDefaultChannelOrder();
 
-    mMixData.resize(mDevice->UpdateSize * mDevice->frameSizeFromFmt());
+    mMixData.resize(size_t{mDevice->UpdateSize} * mDevice->frameSizeFromFmt());
 
     return true;
 }
@@ -455,8 +447,6 @@ struct OSScapture final : public BackendBase {
 
     std::atomic<bool> mKillNow{true};
     std::thread mThread;
-
-    DEF_NEWDEL(OSScapture)
 };
 
 OSScapture::~OSScapture()
@@ -617,7 +607,7 @@ void OSScapture::stop()
 }
 
 void OSScapture::captureSamples(std::byte *buffer, uint samples)
-{ mRing->read(buffer, samples); }
+{ std::ignore = mRing->read(buffer, samples); }
 
 uint OSScapture::availableSamples()
 { return static_cast<uint>(mRing->readSpace()); }
@@ -633,9 +623,9 @@ BackendFactory &OSSBackendFactory::getFactory()
 
 bool OSSBackendFactory::init()
 {
-    if(auto devopt = ConfigValueStr(nullptr, "oss", "device"))
+    if(auto devopt = ConfigValueStr({}, "oss", "device"))
         DefaultPlayback = std::move(*devopt);
-    if(auto capopt = ConfigValueStr(nullptr, "oss", "capture"))
+    if(auto capopt = ConfigValueStr({}, "oss", "capture"))
         DefaultCapture = std::move(*capopt);
 
     return true;

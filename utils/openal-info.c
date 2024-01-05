@@ -45,11 +45,11 @@
 #define FUNCTION_CAST(T, ptr) (T)(ptr)
 #endif
 
-#define MAX_WIDTH  80
+enum { MaxWidth = 80 };
 
 static void printList(const char *list, char separator)
 {
-    size_t col = MAX_WIDTH, len;
+    size_t col = MaxWidth, len;
     const char *indent = "    ";
     const char *next;
 
@@ -71,7 +71,7 @@ static void printList(const char *list, char separator)
         else
             len = strlen(list);
 
-        if(len + col + 2 >= MAX_WIDTH)
+        if(len + col + 2 >= MaxWidth)
         {
             fprintf(stdout, "\n%s", indent);
             col = strlen(indent);
@@ -181,6 +181,14 @@ static void printHRTFInfo(ALCdevice *device)
     checkALCErrors(device);
 }
 
+static void printALCIntegerValue(ALCdevice *device, ALCenum enumValue, char* enumName)
+{
+    ALCint value;
+    alcGetIntegerv(device, enumValue, 1, &value);
+    if (checkALCErrors(device) == ALC_NO_ERROR)
+        printf("%s: %d\n", enumName, value);
+}
+
 static void printModeInfo(ALCdevice *device)
 {
     ALCint srate = 0;
@@ -228,6 +236,9 @@ static void printModeInfo(ALCdevice *device)
         }
         printf("Device HRTF profile: %s\n", hrtfname ? hrtfname : "<null>");
     }
+
+    printALCIntegerValue(device, ALC_MONO_SOURCES, "Device number of mono sources");
+    printALCIntegerValue(device, ALC_STEREO_SOURCES, "Device number of stereo sources");
 }
 
 static void printALCSOFTSystemEventIsSupportedResult(LPALCEVENTISSUPPORTEDSOFT alcEventIsSupportedSOFT, ALCenum eventType, ALCenum deviceType)
@@ -382,7 +393,7 @@ static void printEFXInfo(ALCdevice *device)
 
         palFilteri(object, AL_FILTER_TYPE, filters[i]);
         if(alGetError() != AL_NO_ERROR)
-            memmove(current, next+1, strlen(next));
+            memmove(current, next+1, strlen(next)); /* NOLINT(clang-analyzer-security.insecureAPI.*) */
         else
             current = next+1;
     }
@@ -401,7 +412,7 @@ static void printEFXInfo(ALCdevice *device)
 
         palEffecti(object, AL_EFFECT_TYPE, effects[i]);
         if(alGetError() != AL_NO_ERROR)
-            memmove(current, next+1, strlen(next));
+            memmove(current, next+1, strlen(next)); /* NOLINT(clang-analyzer-security.insecureAPI.*) */
         else
             current = next+1;
     }
@@ -414,7 +425,7 @@ static void printEFXInfo(ALCdevice *device)
 
             palEffecti(object, AL_EFFECT_TYPE, dedeffects[i]);
             if(alGetError() != AL_NO_ERROR)
-                memmove(current, next+1, strlen(next));
+                memmove(current, next+1, strlen(next)); /* NOLINT(clang-analyzer-security.insecureAPI.*) */
             else
                 current = next+1;
         }
@@ -425,7 +436,7 @@ static void printEFXInfo(ALCdevice *device)
         {
             char *next = strchr(current, ',');
             assert(next != NULL);
-            memmove(current, next+1, strlen(next));
+            memmove(current, next+1, strlen(next)); /* NOLINT(clang-analyzer-security.insecureAPI.*) */
         }
     }
     printf("Supported effects:");

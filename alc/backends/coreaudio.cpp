@@ -337,8 +337,6 @@ struct CoreAudioPlayback final : public BackendBase {
 
     uint mFrameSize{0u};
     AudioStreamBasicDescription mFormat{}; // This is the OpenAL format as a CoreAudio ASBD
-
-    DEF_NEWDEL(CoreAudioPlayback)
 };
 
 CoreAudioPlayback::~CoreAudioPlayback()
@@ -623,8 +621,6 @@ struct CoreAudioCapture final : public BackendBase {
     std::vector<char> mCaptureData;
 
     RingBufferPtr mRing{nullptr};
-
-    DEF_NEWDEL(CoreAudioCapture)
 };
 
 CoreAudioCapture::~CoreAudioCapture()
@@ -657,7 +653,7 @@ OSStatus CoreAudioCapture::RecordProc(AudioUnitRenderActionFlags *ioActionFlags,
         return err;
     }
 
-    mRing->write(mCaptureData.data(), inNumberFrames);
+    std::ignore = mRing->write(mCaptureData.data(), inNumberFrames);
     return noErr;
 }
 
@@ -924,7 +920,7 @@ void CoreAudioCapture::captureSamples(std::byte *buffer, uint samples)
 {
     if(!mConverter)
     {
-        mRing->read(buffer, samples);
+        std::ignore = mRing->read(buffer, samples);
         return;
     }
 
