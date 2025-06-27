@@ -80,8 +80,8 @@
 #define PFFFT_H
 
 #include <cstddef>
-#include <cstdint>
-#include <utility>
+#include <iterator>
+#include <memory>
 
 #include "almalloc.h"
 
@@ -92,19 +92,22 @@
 struct PFFFT_Setup;
 
 /* direction of the transform */
-enum pffft_direction_t { PFFFT_FORWARD, PFFFT_BACKWARD };
+enum pffft_direction_t : bool { PFFFT_FORWARD, PFFFT_BACKWARD };
 
 /* type of transform */
-enum pffft_transform_t { PFFFT_REAL, PFFFT_COMPLEX };
+enum pffft_transform_t : bool { PFFFT_REAL, PFFFT_COMPLEX };
+
+struct PFFFTSetupDeleter {
+    void operator()(gsl::owner<PFFFT_Setup*> setup) const noexcept;
+};
+using PFFFTSetupPtr = std::unique_ptr<PFFFT_Setup,PFFFTSetupDeleter>;
 
 /**
  * Prepare for performing transforms of size N -- the returned PFFFT_Setup
  * structure is read-only so it can safely be shared by multiple concurrent
  * threads.
  */
-[[gnu::malloc]]
-gsl::owner<PFFFT_Setup*> pffft_new_setup(unsigned int N, pffft_transform_t transform);
-void pffft_destroy_setup(gsl::owner<PFFFT_Setup*> setup) noexcept;
+PFFFTSetupPtr pffft_new_setup(unsigned int N, pffft_transform_t transform);
 
 /**
  * Perform a Fourier transform. The z-domain data is stored in the most
@@ -172,45 +175,57 @@ void pffft_zconvolve_accumulate(const PFFFT_Setup *setup, const float *dft_a, co
 
 
 struct PFFFTSetup {
-    gsl::owner<PFFFT_Setup*> mSetup{};
+    PFFFTSetupPtr mSetup;
 
     PFFFTSetup() = default;
     PFFFTSetup(const PFFFTSetup&) = delete;
-    PFFFTSetup(PFFFTSetup&& rhs) noexcept : mSetup{rhs.mSetup} { rhs.mSetup = nullptr; }
+    PFFFTSetup(PFFFTSetup&& rhs) noexcept = default;
     explicit PFFFTSetup(std::nullptr_t) noexcept { }
     explicit PFFFTSetup(unsigned int n, pffft_transform_t transform)
         : mSetup{pffft_new_setup(n, transform)}
     { }
-    ~PFFFTSetup() { if(mSetup) pffft_destroy_setup(mSetup); }
+    ~PFFFTSetup() = default;
 
     PFFFTSetup& operator=(const PFFFTSetup&) = delete;
-    PFFFTSetup& operator=(PFFFTSetup&& rhs) noexcept
+    PFFFTSetup& operator=(PFFFTSetup&& rhs) noexcept = default;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return mSetup != nullptr; }
+
+    void transform(std::contiguous_iterator auto input, std::contiguous_iterator auto output,
+        std::contiguous_iterator auto work, pffft_direction_t direction) const
     {
-        if(mSetup)
-            pffft_destroy_setup(mSetup);
-        mSetup = rhs.mSetup;
-        rhs.mSetup = nullptr;
-        return *this;
+        pffft_transform(mSetup.get(), std::to_address(input), std::to_address(output),
+            std::to_address(work), direction);
     }
 
-    void transform(const float *input, float *output, float *work, pffft_direction_t direction) const
-    { pffft_transform(mSetup, input, output, work, direction); }
-
-    void transform_ordered(const float *input, float *output, float *work,
+    void transform_ordered(std::contiguous_iterator auto input,
+        std::contiguous_iterator auto output, std::contiguous_iterator auto work,
         pffft_direction_t direction) const
-    { pffft_transform_ordered(mSetup, input, output, work, direction); }
+    {
+        pffft_transform_ordered(mSetup.get(), std::to_address(input), std::to_address(output),
+            std::to_address(work), direction);
+    }
 
-    void zreorder(const float *input, float *output, pffft_direction_t direction) const
-    { pffft_zreorder(mSetup, input, output, direction); }
+    void zreorder(std::contiguous_iterator auto input, std::contiguous_iterator auto output,
+        pffft_direction_t direction) const
+    {
+        pffft_zreorder(mSetup.get(), std::to_address(input), std::to_address(output), direction);
+    }
 
-    void zconvolve_scale_accumulate(const float *dft_a, const float *dft_b, float *dft_ab,
-        float scaling) const
-    { pffft_zconvolve_scale_accumulate(mSetup, dft_a, dft_b, dft_ab, scaling); }
+    void zconvolve_scale_accumulate(std::contiguous_iterator auto dft_a,
+        std::contiguous_iterator auto dft_b, std::contiguous_iterator auto dft_ab,
+        std::floating_point auto scaling) const
+    {
+        pffft_zconvolve_scale_accumulate(mSetup.get(), std::to_address(dft_a),
+            std::to_address(dft_b), std::to_address(dft_ab), scaling);
+    }
 
-    void zconvolve_accumulate(const float *dft_a, const float *dft_b, float *dft_ab) const
-    { pffft_zconvolve_accumulate(mSetup, dft_a, dft_b, dft_ab); }
-
-    [[nodiscard]] operator bool() const noexcept { return mSetup != nullptr; }
+    void zconvolve_accumulate(std::contiguous_iterator auto dft_a,
+        std::contiguous_iterator auto dft_b, std::contiguous_iterator auto dft_ab) const
+    {
+        pffft_zconvolve_accumulate(mSetup.get(), std::to_address(dft_a), std::to_address(dft_b),
+            std::to_address(dft_ab));
+    }
 };
 
 #endif // PFFFT_H

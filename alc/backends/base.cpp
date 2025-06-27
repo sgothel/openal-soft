@@ -3,51 +3,35 @@
 
 #include "base.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
+#include <utility>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <mmreg.h>
-
-#include "albit.h"
-#include "core/logging.h"
-#endif
-
-#include "atomic.h"
 #include "core/devformat.h"
 
 
 namespace al {
+auto backend_exception::make_string(fmt::string_view fmt, fmt::format_args args) -> std::string
+{ return fmt::vformat(fmt, std::move(args)); }
 
-backend_exception::backend_exception(backend_error code, const char *msg, ...) : mErrorCode{code}
-{
-    std::va_list args;
-    va_start(args, msg);
-    setMessage(msg, args);
-    va_end(args);
-}
 backend_exception::~backend_exception() = default;
-
 } // namespace al
 
 
 bool BackendBase::reset()
 { throw al::backend_exception{al::backend_error::DeviceError, "Invalid BackendBase call"}; }
 
-void BackendBase::captureSamples(std::byte*, uint)
+void BackendBase::captureSamples(std::span<std::byte> outbuffer [[maybe_unused]])
 { }
 
-uint BackendBase::availableSamples()
-{ return 0; }
+auto BackendBase::availableSamples() -> uint
+{ return 0u; }
 
-ClockLatency BackendBase::getClockLatency()
+auto BackendBase::getClockLatency() -> ClockLatency
 {
-    ClockLatency ret{};
+    auto ret = ClockLatency{};
 
-    uint refcount;
+    auto refcount = uint{};
     do {
         refcount = mDevice->waitForMix();
         ret.ClockTime = mDevice->getClockTime();
@@ -58,13 +42,13 @@ ClockLatency BackendBase::getClockLatency()
      * any given time during playback. Without a more accurate measurement from
      * the output, this is an okay approximation.
      */
-    ret.Latency = std::chrono::seconds{mDevice->BufferSize - mDevice->UpdateSize};
-    ret.Latency /= mDevice->Frequency;
+    ret.Latency = std::chrono::seconds{mDevice->mBufferSize - mDevice->mUpdateSize};
+    ret.Latency /= mDevice->mSampleRate;
 
     return ret;
 }
 
-void BackendBase::setDefaultWFXChannelOrder()
+void BackendBase::setDefaultWFXChannelOrder() const
 {
     mDevice->RealOut.ChannelIndex.fill(InvalidChannelIndex);
 
@@ -124,6 +108,24 @@ void BackendBase::setDefaultWFXChannelOrder()
         mDevice->RealOut.ChannelIndex[TopBackLeft]   = 10;
         mDevice->RealOut.ChannelIndex[TopBackRight]  = 11;
         break;
+    case DevFmtX7144:
+        mDevice->RealOut.ChannelIndex[FrontLeft]        = 0;
+        mDevice->RealOut.ChannelIndex[FrontRight]       = 1;
+        mDevice->RealOut.ChannelIndex[FrontCenter]      = 2;
+        mDevice->RealOut.ChannelIndex[LFE]              = 3;
+        mDevice->RealOut.ChannelIndex[BackLeft]         = 4;
+        mDevice->RealOut.ChannelIndex[BackRight]        = 5;
+        mDevice->RealOut.ChannelIndex[SideLeft]         = 6;
+        mDevice->RealOut.ChannelIndex[SideRight]        = 7;
+        mDevice->RealOut.ChannelIndex[TopFrontLeft]     = 8;
+        mDevice->RealOut.ChannelIndex[TopFrontRight]    = 9;
+        mDevice->RealOut.ChannelIndex[TopBackLeft]      = 10;
+        mDevice->RealOut.ChannelIndex[TopBackRight]     = 11;
+        mDevice->RealOut.ChannelIndex[BottomFrontLeft]  = 12;
+        mDevice->RealOut.ChannelIndex[BottomFrontRight] = 13;
+        mDevice->RealOut.ChannelIndex[BottomBackLeft]   = 14;
+        mDevice->RealOut.ChannelIndex[BottomBackRight]  = 15;
+        break;
     case DevFmtX3D71:
         mDevice->RealOut.ChannelIndex[FrontLeft]   = 0;
         mDevice->RealOut.ChannelIndex[FrontRight]  = 1;
@@ -139,7 +141,7 @@ void BackendBase::setDefaultWFXChannelOrder()
     }
 }
 
-void BackendBase::setDefaultChannelOrder()
+void BackendBase::setDefaultChannelOrder() const
 {
     mDevice->RealOut.ChannelIndex.fill(InvalidChannelIndex);
 
@@ -176,6 +178,24 @@ void BackendBase::setDefaultChannelOrder()
         mDevice->RealOut.ChannelIndex[TopFrontRight] = 9;
         mDevice->RealOut.ChannelIndex[TopBackLeft]   = 10;
         mDevice->RealOut.ChannelIndex[TopBackRight]  = 11;
+        break;
+    case DevFmtX7144:
+        mDevice->RealOut.ChannelIndex[FrontLeft]        = 0;
+        mDevice->RealOut.ChannelIndex[FrontRight]       = 1;
+        mDevice->RealOut.ChannelIndex[BackLeft]         = 2;
+        mDevice->RealOut.ChannelIndex[BackRight]        = 3;
+        mDevice->RealOut.ChannelIndex[FrontCenter]      = 4;
+        mDevice->RealOut.ChannelIndex[LFE]              = 5;
+        mDevice->RealOut.ChannelIndex[SideLeft]         = 6;
+        mDevice->RealOut.ChannelIndex[SideRight]        = 7;
+        mDevice->RealOut.ChannelIndex[TopFrontLeft]     = 8;
+        mDevice->RealOut.ChannelIndex[TopFrontRight]    = 9;
+        mDevice->RealOut.ChannelIndex[TopBackLeft]      = 10;
+        mDevice->RealOut.ChannelIndex[TopBackRight]     = 11;
+        mDevice->RealOut.ChannelIndex[BottomFrontLeft]  = 12;
+        mDevice->RealOut.ChannelIndex[BottomFrontRight] = 13;
+        mDevice->RealOut.ChannelIndex[BottomBackLeft]   = 14;
+        mDevice->RealOut.ChannelIndex[BottomBackRight]  = 15;
         break;
     case DevFmtX3D71:
         mDevice->RealOut.ChannelIndex[FrontLeft]   = 0;

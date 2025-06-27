@@ -20,60 +20,55 @@
 
 #include "config.h"
 
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
+#include <string_view>
 
 #include "AL/al.h"
 #include "AL/alc.h"
 
 #include "alc/context.h"
 #include "alstring.h"
-#include "core/except.h"
 #include "direct_defs.h"
-#include "opthelpers.h"
 
 
-AL_API DECL_FUNC1(ALboolean, alIsExtensionPresent, const ALchar*)
-FORCE_ALIGN ALboolean AL_APIENTRY alIsExtensionPresentDirect(ALCcontext *context, const ALchar *extName) noexcept
+AL_API DECL_FUNC1(ALboolean, alIsExtensionPresent, const ALchar*,extName)
+FORCE_ALIGN auto AL_APIENTRY alIsExtensionPresentDirect(ALCcontext *context, const ALchar *extName)
+    noexcept -> ALboolean
 {
-    if(!extName) UNLIKELY
+    if(!extName) [[unlikely]]
     {
         context->setError(AL_INVALID_VALUE, "NULL pointer");
         return AL_FALSE;
     }
 
-    size_t len{strlen(extName)};
-    for(std::string_view ext : context->mExtensions)
-    {
-        if(len == ext.length() && al::strncasecmp(ext.data(), extName, len) == 0)
-            return AL_TRUE;
-    }
-
-    return AL_FALSE;
+    const auto tofind = std::string_view{extName};
+    const auto found = std::ranges::any_of(context->mExtensions, [tofind](std::string_view ext)
+    { return tofind.size() == ext.size() && al::case_compare(ext, tofind) == 0; });
+    return found ? AL_TRUE : AL_FALSE;
 }
 
 
-AL_API ALvoid* AL_APIENTRY alGetProcAddress(const ALchar *funcName) noexcept
+AL_API auto AL_APIENTRY alGetProcAddress(const ALchar *funcName) noexcept -> ALvoid*
 {
     if(!funcName) return nullptr;
     return alcGetProcAddress(nullptr, funcName);
 }
 
-FORCE_ALIGN ALvoid* AL_APIENTRY alGetProcAddressDirect(ALCcontext*, const ALchar *funcName) noexcept
+FORCE_ALIGN auto AL_APIENTRY alGetProcAddressDirect(ALCcontext*, const ALchar *funcName) noexcept
+    -> ALvoid*
 {
     if(!funcName) return nullptr;
     return alcGetProcAddress(nullptr, funcName);
 }
 
-AL_API ALenum AL_APIENTRY alGetEnumValue(const ALchar *enumName) noexcept
+AL_API auto AL_APIENTRY alGetEnumValue(const ALchar *enumName) noexcept -> ALenum
 {
-    if(!enumName) return static_cast<ALenum>(0);
+    if(!enumName) return ALenum{0};
     return alcGetEnumValue(nullptr, enumName);
 }
 
-FORCE_ALIGN ALenum AL_APIENTRY alGetEnumValueDirect(ALCcontext*, const ALchar *enumName) noexcept
+FORCE_ALIGN auto AL_APIENTRY alGetEnumValueDirect(ALCcontext*, const ALchar *enumName) noexcept
+    -> ALenum
 {
-    if(!enumName) return static_cast<ALenum>(0);
+    if(!enumName) return ALenum{0};
     return alcGetEnumValue(nullptr, enumName);
 }

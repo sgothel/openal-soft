@@ -5,14 +5,17 @@
 #include <bitset>
 #include <cstdint>
 #include <string_view>
+#include <utility>
+#include <variant>
 
 #include "AL/al.h"
+#include "AL/alc.h"
 #include "AL/efx.h"
 
-#include "al/effects/effects.h"
-#include "alc/effects/base.h"
 #include "almalloc.h"
 #include "alnumeric.h"
+#include "core/effects/base.h"
+#include "effects/effects.h"
 
 
 enum {
@@ -41,14 +44,20 @@ struct EffectList {
     ALuint type;
     ALenum val;
 };
-extern const std::array<EffectList,16> gEffectList;
+DECL_HIDDEN extern const std::array<EffectList,16> gEffectList;
 
+using EffectHandlerVariant = std::variant<NullEffectHandler,ReverbEffectHandler,
+    StdReverbEffectHandler,AutowahEffectHandler,ChorusEffectHandler,CompressorEffectHandler,
+    DistortionEffectHandler,EchoEffectHandler,EqualizerEffectHandler,FlangerEffectHandler,
+    FshifterEffectHandler,ModulatorEffectHandler,PshifterEffectHandler,VmorpherEffectHandler,
+    DedicatedDialogEffectHandler,DedicatedLfeEffectHandler,ConvolutionEffectHandler>;
 
 struct ALeffect {
     // Effect type (AL_EFFECT_NULL, ...)
     ALenum type{AL_EFFECT_NULL};
 
-    EffectProps Props{};
+    EffectHandlerVariant PropsVariant;
+    EffectProps Props;
 
     /* Self ID */
     ALuint id{0u};
@@ -60,7 +69,7 @@ struct ALeffect {
 
 void InitEffect(ALeffect *effect);
 
-void LoadReverbPreset(const char *name, ALeffect *effect);
+void LoadReverbPreset(const std::string_view name, ALeffect *effect);
 
 bool IsValidEffectType(ALenum type) noexcept;
 

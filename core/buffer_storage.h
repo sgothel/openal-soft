@@ -1,62 +1,15 @@
 #ifndef CORE_BUFFER_STORAGE_H
 #define CORE_BUFFER_STORAGE_H
 
-#include <atomic>
-#include <cstddef>
+#include <span>
+#include <variant>
 
-#include "alnumeric.h"
-#include "alspan.h"
 #include "ambidefs.h"
+#include "fmt_traits.h"
+#include "storage_formats.h"
 
 
 using uint = unsigned int;
-
-/* Storable formats */
-enum FmtType : unsigned char {
-    FmtUByte,
-    FmtShort,
-    FmtInt,
-    FmtFloat,
-    FmtDouble,
-    FmtMulaw,
-    FmtAlaw,
-    FmtIMA4,
-    FmtMSADPCM,
-};
-enum FmtChannels : unsigned char {
-    FmtMono,
-    FmtStereo,
-    FmtRear,
-    FmtQuad,
-    FmtX51, /* (WFX order) */
-    FmtX61, /* (WFX order) */
-    FmtX71, /* (WFX order) */
-    FmtBFormat2D,
-    FmtBFormat3D,
-    FmtUHJ2, /* 2-channel UHJ, aka "BHJ", stereo-compatible */
-    FmtUHJ3, /* 3-channel UHJ, aka "THJ" */
-    FmtUHJ4, /* 4-channel UHJ, aka "PHJ" */
-    FmtSuperStereo, /* Stereo processed with Super Stereo. */
-};
-
-enum class AmbiLayout : unsigned char {
-    FuMa,
-    ACN,
-};
-enum class AmbiScaling : unsigned char {
-    FuMa,
-    SN3D,
-    N3D,
-    UHJ,
-};
-
-const char *NameFromFormat(FmtType type) noexcept;
-const char *NameFromFormat(FmtChannels channels) noexcept;
-
-uint BytesFromFmt(FmtType type) noexcept;
-uint ChannelsFromFmt(FmtChannels chans, uint ambiorder) noexcept;
-inline uint FrameSizeFromFmt(FmtChannels chans, FmtType type, uint ambiorder) noexcept
-{ return ChannelsFromFmt(chans, ambiorder) * BytesFromFmt(type); }
 
 constexpr bool IsBFormat(FmtChannels chans) noexcept
 { return chans == FmtBFormat2D || chans == FmtBFormat3D; }
@@ -80,13 +33,23 @@ constexpr bool Is2DAmbisonic(FmtChannels chans) noexcept
 }
 
 
-using CallbackType = int(*)(void*, void*, int);
+using CallbackType = int(*)(void*, void*, int) noexcept;
+
+using SampleVariant = std::variant<std::span<uint8_t>,
+    std::span<int16_t>,
+    std::span<int32_t>,
+    std::span<float>,
+    std::span<double>,
+    std::span<MulawSample>,
+    std::span<AlawSample>,
+    std::span<IMA4Data>,
+    std::span<MSADPCMData>>;
 
 struct BufferStorage {
     CallbackType mCallback{nullptr};
     void *mUserData{nullptr};
 
-    al::span<std::byte> mData;
+    SampleVariant mData;
 
     uint mSampleRate{0u};
     FmtChannels mChannels{FmtMono};
@@ -101,7 +64,8 @@ struct BufferStorage {
     [[nodiscard]] auto bytesFromFmt() const noexcept -> uint { return BytesFromFmt(mType); }
     [[nodiscard]] auto channelsFromFmt() const noexcept -> uint
     { return ChannelsFromFmt(mChannels, mAmbiOrder); }
-    [[nodiscard]] auto frameSizeFromFmt() const noexcept -> uint { return channelsFromFmt() * bytesFromFmt(); }
+    [[nodiscard]] auto frameSizeFromFmt() const noexcept -> uint
+    { return channelsFromFmt() * bytesFromFmt(); }
 
     [[nodiscard]] auto blockSizeFromFmt() const noexcept -> uint
     {

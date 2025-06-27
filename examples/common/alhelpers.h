@@ -2,13 +2,14 @@
 #define ALHELPERS_H
 
 #include "AL/al.h"
+#include "AL/alc.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Some helper functions to get the name from the format enums. */
-const char *FormatName(ALenum type);
+const char *FormatName(ALenum format);
 
 /* Easy device init/deinit functions. InitAL returns 0 on success. */
 int InitAL(char ***argv, int *argc);
@@ -23,7 +24,7 @@ void al_nssleep(unsigned long nsec);
  * still needs to use a normal cast and live with the warning (C++ is fine with
  * a regular reinterpret_cast).
  */
-#if __STDC_VERSION__ >= 199901L
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
 #define FUNCTION_CAST(T, ptr) (union{void *p; T f;}){ptr}.f
 #elif defined(__cplusplus)
 #define FUNCTION_CAST(T, ptr) reinterpret_cast<T>(ptr)

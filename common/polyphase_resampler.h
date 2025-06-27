@@ -1,6 +1,7 @@
 #ifndef POLYPHASE_RESAMPLER_H
 #define POLYPHASE_RESAMPLER_H
 
+#include <span>
 #include <vector>
 
 
@@ -35,7 +36,7 @@ using uint = unsigned int;
 
 struct PPhaseResampler {
     void init(const uint srcRate, const uint dstRate);
-    void process(const uint inN, const double *in, const uint outN, double *out);
+    void process(const std::span<const double> in, const std::span<double> out) const;
 
     explicit operator bool() const noexcept { return !mF.empty(); }
 

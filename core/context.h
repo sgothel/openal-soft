@@ -1,27 +1,27 @@
 #ifndef CORE_CONTEXT_H
 #define CORE_CONTEXT_H
 
+#include "config.h"
+
 #include <array>
 #include <atomic>
 #include <bitset>
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
-#include "almalloc.h"
-#include "alsem.h"
-#include "alspan.h"
 #include "async_event.h"
 #include "atomic.h"
 #include "flexarray.h"
 #include "opthelpers.h"
+#include "ringbuffer.h"
 #include "vecmat.h"
 
 struct DeviceBase;
 struct EffectSlot;
 struct EffectSlotProps;
-struct RingBuffer;
 struct Voice;
 struct VoiceChange;
 struct VoicePropsItem;
@@ -53,6 +53,9 @@ struct ContextProps {
     float DopplerFactor;
     float DopplerVelocity;
     float SpeedOfSound;
+#if ALSOFT_EAX
+    float DistanceFactor;
+#endif
     bool SourceDistanceModel;
     DistanceModel mDistanceModel;
 
@@ -63,9 +66,9 @@ struct ContextParams {
     /* Pointer to the most recent property values that are awaiting an update. */
     std::atomic<ContextProps*> ContextUpdate{nullptr};
 
-    alu::Vector Position{};
+    alu::Vector Position;
     alu::Matrix Matrix{alu::Matrix::Identity()};
-    alu::Vector Velocity{};
+    alu::Vector Velocity;
 
     float Gain{1.0f};
     float MetersPerUnit{1.0f};
@@ -103,7 +106,7 @@ struct ContextBase {
      * last processed, and any after are pending.
      */
     VoiceChange *mVoiceChangeTail{};
-    std::atomic<VoiceChange*> mCurrentVoiceChange{};
+    std::atomic<VoiceChange*> mCurrentVoiceChange;
 
     void allocVoiceChanges();
     void allocVoiceProps();
@@ -113,16 +116,16 @@ struct ContextBase {
     ContextParams mParams;
 
     using VoiceArray = al::FlexArray<Voice*>;
-    al::atomic_unique_ptr<VoiceArray> mVoices{};
-    std::atomic<size_t> mActiveVoiceCount{};
+    al::atomic_unique_ptr<VoiceArray> mVoices;
+    std::atomic<size_t> mActiveVoiceCount;
 
     void allocVoices(size_t addcount);
-    [[nodiscard]] auto getVoicesSpan() const noexcept -> al::span<Voice*>
+    [[nodiscard]] auto getVoicesSpan() const noexcept LIFETIMEBOUND -> std::span<Voice*>
     {
         return {mVoices.load(std::memory_order_relaxed)->data(),
             mActiveVoiceCount.load(std::memory_order_relaxed)};
     }
-    [[nodiscard]] auto getVoicesSpanAcquired() const noexcept -> al::span<Voice*>
+    [[nodiscard]] auto getVoicesSpanAcquired() const noexcept LIFETIMEBOUND -> std::span<Voice*>
     {
         return {mVoices.load(std::memory_order_acquire)->data(),
             mActiveVoiceCount.load(std::memory_order_acquire)};
@@ -130,11 +133,15 @@ struct ContextBase {
 
 
     using EffectSlotArray = al::FlexArray<EffectSlot*>;
-    std::atomic<EffectSlotArray*> mActiveAuxSlots{nullptr};
+    /* This array is split in half. The front half is the list of activated
+     * effect slots as set by the app, and the back half is the same list but
+     * sorted to ensure later effect slots are fed by earlier ones.
+     */
+    al::atomic_unique_ptr<EffectSlotArray> mActiveAuxSlots;
 
     std::thread mEventThread;
-    al::semaphore mEventSem;
-    std::unique_ptr<RingBuffer> mAsyncEvents;
+    FifoBufferPtr<AsyncEvent> mAsyncEvents;
+    std::atomic<bool> mEventsPending;
     using AsyncEventBitset = std::bitset<al::to_underlying(AsyncEnableBits::Count)>;
     std::atomic<AsyncEventBitset> mEnabledEvts{0u};
 
@@ -153,7 +160,7 @@ struct ContextBase {
     std::vector<VoicePropsCluster> mVoicePropClusters;
 
 
-    EffectSlot *getEffectSlot();
+    EffectSlot *getEffectSlot() LIFETIMEBOUND;
 
     using EffectSlotCluster = std::unique_ptr<std::array<EffectSlot,4>>;
     std::vector<EffectSlotCluster> mEffectSlotClusters;
@@ -168,10 +175,10 @@ struct ContextBase {
     std::vector<ContextPropsCluster> mContextPropClusters;
 
 
-    ContextBase(DeviceBase *device);
+    explicit ContextBase(DeviceBase *device LIFETIMEBOUND);
     ContextBase(const ContextBase&) = delete;
     ContextBase& operator=(const ContextBase&) = delete;
-    ~ContextBase();
+    virtual ~ContextBase();
 };
 
 #endif /* CORE_CONTEXT_H */

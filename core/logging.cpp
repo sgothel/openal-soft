@@ -10,21 +10,24 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <vector>
+#include <string_view>
+#include <utility>
 
-#include "alspan.h"
-#include "strutils.h"
+#include "alstring.h"
+#include "strutils.hpp"
 
 
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #elif defined(__ANDROID__)
 #include <android/log.h>
 #endif
 
 
-FILE *gLogFile{stderr};
+FILE *gLogFile{stderr}; /* NOLINT(cert-err58-cpp)
+ * stderr is a non-noexcept function call on some systems, but as a "C global",
+ * it should be safe to invoke during initialization.
+ */
 #ifdef _DEBUG
 LogLevel gLogLevel{LogLevel::Warning};
 #else
@@ -33,6 +36,8 @@ LogLevel gLogLevel{LogLevel::Error};
 
 
 namespace {
+
+using namespace std::string_view_literals;
 
 enum class LogState : uint8_t {
     FirstRun,
@@ -46,7 +51,7 @@ LogState gLogState{LogState::FirstRun};
 LogCallbackFunc gLogCallback{};
 void *gLogCallbackPtr{};
 
-constexpr std::optional<char> GetLevelCode(LogLevel level)
+constexpr auto GetLevelCode(LogLevel level) noexcept -> std::optional<char>
 {
     switch(level)
     {
@@ -75,55 +80,23 @@ void al_set_log_callback(LogCallbackFunc callback, void *userptr)
     }
 }
 
-void al_print(LogLevel level, const char *fmt, ...)
+void al_print_impl(LogLevel level, const fmt::string_view fmt, fmt::format_args args)
 {
-    /* Kind of ugly since string literals are const char arrays with a size
-     * that includes the null terminator, which we want to exclude from the
-     * span.
-     */
-    auto prefix = al::span{"[ALSOFT] (--) "}.first<14>();
+    const auto msg = fmt::vformat(fmt, std::move(args));
+
+    auto prefix = "[ALSOFT] (--) "sv;
     switch(level)
     {
     case LogLevel::Disable: break;
-    case LogLevel::Error: prefix = al::span{"[ALSOFT] (EE) "}.first<14>(); break;
-    case LogLevel::Warning: prefix = al::span{"[ALSOFT] (WW) "}.first<14>(); break;
-    case LogLevel::Trace: prefix = al::span{"[ALSOFT] (II) "}.first<14>(); break;
+    case LogLevel::Error: prefix = "[ALSOFT] (EE) "sv; break;
+    case LogLevel::Warning: prefix = "[ALSOFT] (WW) "sv; break;
+    case LogLevel::Trace: prefix = "[ALSOFT] (II) "sv; break;
     }
-
-    std::vector<char> dynmsg;
-    std::array<char,256> stcmsg{};
-
-    char *str{stcmsg.data()};
-    auto prefend1 = std::copy_n(prefix.begin(), prefix.size(), stcmsg.begin());
-    al::span<char> msg{prefend1, stcmsg.end()};
-
-    std::va_list args, args2;
-    va_start(args, fmt);
-    va_copy(args2, args);
-    const int msglen{std::vsnprintf(msg.data(), msg.size(), fmt, args)};
-    if(msglen >= 0)
-    {
-        if(static_cast<size_t>(msglen) >= msg.size()) UNLIKELY
-        {
-            dynmsg.resize(static_cast<size_t>(msglen)+prefix.size() + 1u);
-
-            str = dynmsg.data();
-            auto prefend2 = std::copy_n(prefix.begin(), prefix.size(), dynmsg.begin());
-            msg = {prefend2, dynmsg.end()};
-
-            std::vsnprintf(msg.data(), msg.size(), fmt, args2);
-        }
-        msg = msg.first(static_cast<size_t>(msglen));
-    }
-    else
-        msg = {msg.data(), std::strlen(msg.data())};
-    va_end(args2);
-    va_end(args);
 
     if(gLogLevel >= level)
     {
         auto logfile = gLogFile;
-        fputs(str, logfile);
+        fmt::println(logfile, "{}{}", prefix, msg);
         fflush(logfile);
     }
 #if defined(_WIN32) && !defined(NDEBUG)
@@ -131,8 +104,7 @@ void al_print(LogLevel level, const char *fmt, ...)
      * informational, warning, or error debug messages. So only print them for
      * non-Release builds.
      */
-    std::wstring wstr{utf8_to_wstr(str)};
-    OutputDebugStringW(wstr.c_str());
+    OutputDebugStringW(utf8_to_wstr(fmt::format("{}{}\n", prefix, msg)).c_str());
 #elif defined(__ANDROID__)
     auto android_severity = [](LogLevel l) noexcept
     {
@@ -147,21 +119,18 @@ void al_print(LogLevel level, const char *fmt, ...)
         }
         return ANDROID_LOG_ERROR;
     };
-    __android_log_print(android_severity(level), "openal", "%s", str);
+    /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg) */
+    __android_log_print(android_severity(level), "openal", "%.*s%s", al::sizei(prefix),
+        prefix.data(), msg.c_str());
 #endif
 
     auto cblock = std::lock_guard{LogCallbackMutex};
     if(gLogState != LogState::Disable)
     {
-        while(!msg.empty() && std::isspace(msg.back()))
-        {
-            msg.back() = '\0';
-            msg = msg.first(msg.size()-1);
-        }
-        if(auto logcode = GetLevelCode(level); logcode && !msg.empty())
+        if(auto logcode = GetLevelCode(level))
         {
             if(gLogCallback)
-                gLogCallback(gLogCallbackPtr, *logcode, msg.data(), static_cast<int>(msg.size()));
+                gLogCallback(gLogCallbackPtr, *logcode, msg.data(), al::sizei(msg));
             else if(gLogState == LogState::FirstRun)
                 gLogState = LogState::Disable;
         }

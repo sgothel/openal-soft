@@ -3,14 +3,18 @@
 
 #include "events.h"
 
-#include "alspan.h"
+#include <ranges>
+#include <span>
+
+#include "alnumeric.h"
 #include "core/logging.h"
 #include "device.h"
+#include "fmt/core.h"
 
 
 namespace {
 
-ALCenum EnumFromEventType(const alc::EventType type)
+auto EnumFromEventType(const alc::EventType type) -> ALCenum
 {
     switch(type)
     {
@@ -19,14 +23,14 @@ ALCenum EnumFromEventType(const alc::EventType type)
     case alc::EventType::DeviceRemoved: return ALC_EVENT_TYPE_DEVICE_REMOVED_SOFT;
     case alc::EventType::Count: break;
     }
-    throw std::runtime_error{"Invalid EventType: "+std::to_string(al::to_underlying(type))};
+    throw std::runtime_error{fmt::format("Invalid EventType: {}", int{al::to_underlying(type)})};
 }
 
 } // namespace
 
 namespace alc {
 
-std::optional<alc::EventType> GetEventType(ALCenum type)
+auto GetEventType(ALCenum type) -> std::optional<alc::EventType>
 {
     switch(type)
     {
@@ -47,8 +51,8 @@ void Event(EventType eventType, DeviceType deviceType, ALCdevice *device, std::s
 
 } // namespace alc
 
-FORCE_ALIGN ALCboolean ALC_APIENTRY alcEventControlSOFT(ALCsizei count, const ALCenum *events,
-    ALCboolean enable) noexcept
+FORCE_ALIGN auto ALC_APIENTRY alcEventControlSOFT(ALCsizei count, const ALCenum *events,
+    ALCboolean enable) noexcept -> ALCboolean
 {
     if(enable != ALC_FALSE && enable != ALC_TRUE)
     {
@@ -68,17 +72,21 @@ FORCE_ALIGN ALCboolean ALC_APIENTRY alcEventControlSOFT(ALCsizei count, const AL
         return ALC_FALSE;
     }
 
-    alc::EventBitSet eventSet{0};
-    for(ALCenum type : al::span{events, static_cast<ALCuint>(count)})
+    auto eventSet = alc::EventBitSet{0};
+    auto eventrange = std::views::counted(events, count);
+    const auto invalidevent = std::ranges::find_if_not(eventrange, [&eventSet](ALCenum type)
     {
-        auto etype = alc::GetEventType(type);
-        if(!etype)
-        {
-            WARN("Invalid event type: 0x%04x\n", type);
-            alcSetError(nullptr, ALC_INVALID_ENUM);
-            return ALC_FALSE;
-        }
+        const auto etype = alc::GetEventType(type);
+        if(!etype) return false;
+
         eventSet.set(al::to_underlying(*etype));
+        return true;
+    });
+    if(invalidevent != eventrange.end())
+    {
+        WARN("Invalid event type: {:#04x}", as_unsigned(*invalidevent));
+        alcSetError(nullptr, ALC_INVALID_ENUM);
+        return ALC_FALSE;
     }
 
     auto eventlock = std::unique_lock{alc::EventMutex};

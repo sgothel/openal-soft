@@ -13,11 +13,7 @@ class MainWindow;
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
-public:
-    explicit MainWindow(QWidget *parent=nullptr);
-    ~MainWindow() override;
-
-private slots:
+private Q_SLOTS:
     void cancelCloseAction();
 
     void saveCurrentConfig();
@@ -33,7 +29,7 @@ private slots:
 
     void updatePeriodSizeEdit(int size);
     void updatePeriodSizeSlider();
-    void updatePeriodCountEdit(int size);
+    void updatePeriodCountEdit(int count);
     void updatePeriodCountSlider();
 
     void selectQuadDecoderFile();
@@ -61,6 +57,10 @@ private slots:
 
     void selectWaveOutput();
 
+public:
+    explicit MainWindow(QWidget *parent=nullptr);
+    ~MainWindow() override;
+
 private:
     std::unique_ptr<QValidator> mPeriodSizeValidator;
     std::unique_ptr<QValidator> mPeriodCountValidator;
@@ -76,7 +76,7 @@ private:
 
     void closeEvent(QCloseEvent *event) override;
 
-    void selectDecoderFile(QLineEdit *line, const char *name);
+    void selectDecoderFile(QLineEdit *line, const char *caption);
 
     QStringList collectHrtfs();
 

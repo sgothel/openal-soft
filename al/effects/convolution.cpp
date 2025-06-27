@@ -1,117 +1,75 @@
 
 #include "config.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <span>
 
 #include "AL/al.h"
-#include "alc/inprogext.h"
 
-#include "alc/effects/base.h"
+#include "alc/context.h"
+#include "alc/inprogext.h"
+#include "alnumeric.h"
 #include "effects.h"
 
 
 namespace {
 
-EffectProps genDefaultProps() noexcept
+consteval auto genDefaultProps() noexcept -> EffectProps
 {
-    ConvolutionProps props{};
-    props.OrientAt = {0.0f,  0.0f, -1.0f};
-    props.OrientUp = {0.0f,  1.0f,  0.0f};
-    return props;
+    return ConvolutionProps{
+        .OrientAt = {0.0f,  0.0f, -1.0f},
+        .OrientUp = {0.0f,  1.0f,  0.0f}};
 }
 
 } // namespace
 
-const EffectProps ConvolutionEffectProps{genDefaultProps()};
+constinit const EffectProps ConvolutionEffectProps(genDefaultProps());
 
-void EffectHandler::SetParami(ConvolutionProps& /*props*/, ALenum param, int /*val*/)
+void ConvolutionEffectHandler::SetParami(ALCcontext *context, ConvolutionProps& /*props*/, ALenum param, int /*val*/)
+{ context->throw_error(AL_INVALID_ENUM, "Invalid convolution effect integer property {:#04x}", as_unsigned(param)); }
+void ConvolutionEffectHandler::SetParamiv(ALCcontext *context, ConvolutionProps &props, ALenum param, const int *vals)
+{ SetParami(context, props, param, *vals); }
+
+void ConvolutionEffectHandler::SetParamf(ALCcontext *context, ConvolutionProps& /*props*/, ALenum param, float /*val*/)
+{ context->throw_error(AL_INVALID_ENUM, "Invalid convolution effect float property {:#04x}", as_unsigned(param)); }
+void ConvolutionEffectHandler::SetParamfv(ALCcontext *context, ConvolutionProps &props, ALenum param, const float *values)
 {
+    static constexpr auto finite_checker = [](float val) -> bool { return std::isfinite(val); };
+
     switch(param)
     {
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid convolution effect integer property 0x%04x",
-            param};
+    case AL_CONVOLUTION_ORIENTATION_SOFT:
+        const auto vals = std::span{values, 6_uz};
+        if(!std::all_of(vals.begin(), vals.end(), finite_checker))
+            context->throw_error(AL_INVALID_VALUE, "Convolution orientation out of range", param);
+
+        std::copy_n(vals.begin(), props.OrientAt.size(), props.OrientAt.begin());
+        std::copy_n(vals.begin()+3, props.OrientUp.size(), props.OrientUp.begin());
+        return;
     }
+
+    SetParamf(context, props, param, *values);
 }
-void EffectHandler::SetParamiv(ConvolutionProps &props, ALenum param, const int *vals)
-{
-    switch(param)
-    {
-    default:
-        SetParami(props, param, vals[0]);
-    }
-}
-void EffectHandler::SetParamf(ConvolutionProps& /*props*/, ALenum param, float /*val*/)
-{
-    switch(param)
-    {
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid convolution effect float property 0x%04x",
-            param};
-    }
-}
-void EffectHandler::SetParamfv(ConvolutionProps &props, ALenum param, const float *values)
+
+void ConvolutionEffectHandler::GetParami(ALCcontext *context, const ConvolutionProps& /*props*/, ALenum param, int* /*val*/)
+{ context->throw_error(AL_INVALID_ENUM, "Invalid convolution effect integer property {:#04x}", as_unsigned(param)); }
+void ConvolutionEffectHandler::GetParamiv(ALCcontext *context, const ConvolutionProps &props, ALenum param, int *vals)
+{ GetParami(context, props, param, vals); }
+
+void ConvolutionEffectHandler::GetParamf(ALCcontext *context, const ConvolutionProps& /*props*/, ALenum param, float* /*val*/)
+{ context->throw_error(AL_INVALID_ENUM, "Invalid convolution effect float property {:#04x}", as_unsigned(param)); }
+void ConvolutionEffectHandler::GetParamfv(ALCcontext *context, const ConvolutionProps &props, ALenum param, float *values)
 {
     switch(param)
     {
     case AL_CONVOLUTION_ORIENTATION_SOFT:
-        if(!(std::isfinite(values[0]) && std::isfinite(values[1]) && std::isfinite(values[2])
-            && std::isfinite(values[3]) && std::isfinite(values[4]) && std::isfinite(values[5])))
-            throw effect_exception{AL_INVALID_VALUE, "Property 0x%04x value out of range", param};
+        const auto vals = std::span{values, 6_uz};
+        const auto oiter = std::copy(props.OrientAt.cbegin(), props.OrientAt.cend(), vals.begin());
+        std::copy(props.OrientUp.cbegin(), props.OrientUp.cend(), oiter);
+        return;
+    }
 
-        props.OrientAt[0] = values[0];
-        props.OrientAt[1] = values[1];
-        props.OrientAt[2] = values[2];
-        props.OrientUp[0] = values[3];
-        props.OrientUp[1] = values[4];
-        props.OrientUp[2] = values[5];
-        break;
-
-    default:
-        SetParamf(props, param, values[0]);
-    }
-}
-
-void EffectHandler::GetParami(const ConvolutionProps& /*props*/, ALenum param, int* /*val*/)
-{
-    switch(param)
-    {
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid convolution effect integer property 0x%04x",
-            param};
-    }
-}
-void EffectHandler::GetParamiv(const ConvolutionProps &props, ALenum param, int *vals)
-{
-    switch(param)
-    {
-    default:
-        GetParami(props, param, vals);
-    }
-}
-void EffectHandler::GetParamf(const ConvolutionProps& /*props*/, ALenum param, float* /*val*/)
-{
-    switch(param)
-    {
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid convolution effect float property 0x%04x",
-            param};
-    }
-}
-void EffectHandler::GetParamfv(const ConvolutionProps &props, ALenum param, float *values)
-{
-    switch(param)
-    {
-    case AL_CONVOLUTION_ORIENTATION_SOFT:
-        values[0] = props.OrientAt[0];
-        values[1] = props.OrientAt[1];
-        values[2] = props.OrientAt[2];
-        values[3] = props.OrientUp[0];
-        values[4] = props.OrientUp[1];
-        values[5] = props.OrientUp[2];
-        break;
-
-    default:
-        GetParamf(props, param, values);
-    }
+    GetParamf(context, props, param, values);
 }

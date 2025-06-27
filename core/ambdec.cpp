@@ -4,18 +4,20 @@
 #include "ambdec.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
+#include <fstream>
 #include <iterator>
+#include <span>
 #include <sstream>
 #include <string>
 
-#include "albit.h"
-#include "alfstream.h"
-#include "alspan.h"
-#include "opthelpers.h"
+#include "alstring.h"
+#include "filesystem.h"
+#include "fmt/core.h"
 
 
 namespace {
@@ -42,33 +44,13 @@ enum class ReaderScope {
     HFMatrix,
 };
 
-#ifdef __MINGW32__
-[[gnu::format(__MINGW_PRINTF_FORMAT,2,3)]]
-#else
-[[gnu::format(printf,2,3)]]
-#endif
-std::optional<std::string> make_error(size_t linenum, const char *fmt, ...)
+template<typename ...Args>
+auto make_error(size_t linenum, fmt::format_string<Args...> fmt, Args&& ...args)
+    -> std::optional<std::string>
 {
     std::optional<std::string> ret;
-    auto &str = ret.emplace();
-
-    str.resize(256);
-    int printed{std::snprintf(str.data(), str.length(), "Line %zu: ", linenum)};
-    if(printed < 0) printed = 0;
-    auto plen = std::min(static_cast<size_t>(printed), str.length());
-
-    std::va_list args, args2;
-    va_start(args, fmt);
-    va_copy(args2, args);
-    const int msglen{std::vsnprintf(&str[plen], str.size()-plen, fmt, args)};
-    if(msglen >= 0 && static_cast<size_t>(msglen) >= str.size()-plen)
-    {
-        str.resize(static_cast<size_t>(msglen) + plen + 1u);
-        std::vsnprintf(&str[plen], str.size()-plen, fmt, args2);
-    }
-    va_end(args2);
-    va_end(args);
-
+    auto &str = ret.emplace(fmt::format("Line {}: ", linenum));
+    str += fmt::format(std::move(fmt), std::forward<Args>(args)...);
     return ret;
 }
 
@@ -79,9 +61,9 @@ AmbDecConf::~AmbDecConf() = default;
 
 std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
 {
-    al::ifstream f{fname};
+    auto f = fs::ifstream{fs::path(al::char_as_u8(fname))};
     if(!f.is_open())
-        return std::string("Failed to open file \"")+fname+"\"";
+        return fmt::format("Failed to open file \"{}\"", fname);
 
     ReaderScope scope{ReaderScope::Global};
     size_t speaker_pos{0};
@@ -102,7 +84,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
         if(command == "/}")
         {
             if(scope == ReaderScope::Global)
-                return make_error(linenum, "Unexpected /} in global scope");
+                return make_error(linenum, "Unexpected /}} in global scope");
             scope = ReaderScope::Global;
             continue;
         }
@@ -122,12 +104,12 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 istr >> spkr.Connection;
             }
             else
-                return make_error(linenum, "Unexpected speakers command: %s", command.c_str());
+                return make_error(linenum, "Unexpected speakers command: {}", command);
         }
         else if(scope == ReaderScope::LFMatrix || scope == ReaderScope::HFMatrix)
         {
             auto &gains = (scope == ReaderScope::LFMatrix) ? LFOrderGain : HFOrderGain;
-            auto *matrix = (scope == ReaderScope::LFMatrix) ? LFMatrix : HFMatrix;
+            auto matrix = (scope == ReaderScope::LFMatrix) ? LFMatrix : HFMatrix;
             auto &pos = (scope == ReaderScope::LFMatrix) ? lfmatrix_pos : hfmatrix_pos;
 
             if(command == "order_gain")
@@ -156,7 +138,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 float value{};
                 while(mask)
                 {
-                    auto idx = static_cast<unsigned>(al::countr_zero(mask));
+                    auto idx = static_cast<unsigned>(std::countr_zero(mask));
                     mask &= ~(1u << idx);
 
                     istr >> value;
@@ -165,7 +147,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 }
             }
             else
-                return make_error(linenum, "Unexpected matrix command: %s", command.c_str());
+                return make_error(linenum, "Unexpected matrix command: {}", command);
         }
         // Global scope commands
         else if(command == "/description")
@@ -182,7 +164,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 return make_error(linenum, "Duplicate version definition");
             istr >> Version;
             if(Version != 3)
-                return make_error(linenum, "Unsupported version: %d", Version);
+                return make_error(linenum, "Unsupported version: {}", Version);
         }
         else if(command == "/dec/chan_mask")
         {
@@ -191,7 +173,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
             istr >> std::hex >> ChanMask >> std::dec;
 
             if(!ChanMask || ChanMask > Ambi4OrderMask)
-                return make_error(linenum, "Invalid chan_mask: 0x%x", ChanMask);
+                return make_error(linenum, "Invalid chan_mask: {:#x}", ChanMask);
             if(ChanMask > Ambi3OrderMask && CoeffScale == AmbDecScale::FuMa)
                 return make_error(linenum, "FuMa not compatible with over third-order");
         }
@@ -201,7 +183,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 return make_error(linenum, "Duplicate freq_bands");
             istr >> FreqBands;
             if(FreqBands != 1 && FreqBands != 2)
-                return make_error(linenum, "Invalid freq_bands: %u", FreqBands);
+                return make_error(linenum, "Invalid freq_bands: {}", FreqBands);
         }
         else if(command == "/dec/speakers")
         {
@@ -210,7 +192,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
             size_t numspeakers{};
             istr >> numspeakers;
             if(!numspeakers)
-                return make_error(linenum, "Invalid speakers: %zu", numspeakers);
+                return make_error(linenum, "Invalid speakers: {}", numspeakers);
             Speakers.resize(numspeakers);
         }
         else if(command == "/dec/coeff_scale")
@@ -223,7 +205,7 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
             else if(scale == "sn3d") CoeffScale = AmbDecScale::SN3D;
             else if(scale == "fuma") CoeffScale = AmbDecScale::FuMa;
             else
-                return make_error(linenum, "Unexpected coeff_scale: %s", scale.c_str());
+                return make_error(linenum, "Unexpected coeff_scale: {}", scale);
 
             if(ChanMask > Ambi3OrderMask && CoeffScale == AmbDecScale::FuMa)
                 return make_error(linenum, "FuMa not compatible with over third-order");
@@ -258,15 +240,15 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
             if(Matrix.empty())
             {
                 Matrix.resize(Speakers.size() * FreqBands);
-                LFMatrix = Matrix.data();
-                HFMatrix = LFMatrix + Speakers.size()*(FreqBands-1);
+                LFMatrix = std::span{Matrix}.first(Speakers.size());
+                HFMatrix = std::span{Matrix}.subspan(Speakers.size()*(FreqBands-1));
             }
 
             if(FreqBands == 1)
             {
                 if(command != "/matrix/{")
-                    return make_error(linenum, "Unexpected \"%s\" for a single-band decoder",
-                        command.c_str());
+                    return make_error(linenum, "Unexpected \"{}\" for a single-band decoder",
+                        command);
                 scope = ReaderScope::HFMatrix;
             }
             else
@@ -276,15 +258,16 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
                 else if(command == "/hfmatrix/{")
                     scope = ReaderScope::HFMatrix;
                 else
-                    return make_error(linenum, "Unexpected \"%s\" for a dual-band decoder",
-                        command.c_str());
+                    return make_error(linenum, "Unexpected \"{}\" for a dual-band decoder",
+                        command);
             }
         }
         else if(command == "/end")
         {
             const auto endpos = static_cast<std::size_t>(istr.tellg());
             if(!is_at_end(buffer, endpos))
-                return make_error(linenum, "Extra junk on end: %s", buffer.substr(endpos).c_str());
+                return make_error(linenum, "Extra junk on end: {}",
+                    std::string_view{buffer}.substr(endpos));
 
             if(speaker_pos < Speakers.size() || hfmatrix_pos < Speakers.size()
                 || (FreqBands == 2 && lfmatrix_pos < Speakers.size()))
@@ -295,12 +278,13 @@ std::optional<std::string> AmbDecConf::load(const char *fname) noexcept
             return std::nullopt;
         }
         else
-            return make_error(linenum, "Unexpected command: %s", command.c_str());
+            return make_error(linenum, "Unexpected command: {}", command);
 
         istr.clear();
         const auto endpos = static_cast<std::size_t>(istr.tellg());
         if(!is_at_end(buffer, endpos))
-            return make_error(linenum, "Extra junk on line: %s", buffer.substr(endpos).c_str());
+            return make_error(linenum, "Extra junk on line: {}",
+                std::string_view{buffer}.substr(endpos));
         buffer.clear();
     }
     return make_error(linenum, "Unexpected end of file");

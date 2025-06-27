@@ -1,15 +1,16 @@
 #ifndef EAX_EFFECT_INCLUDED
 #define EAX_EFFECT_INCLUDED
 
-
 #include <cassert>
 #include <memory>
 #include <variant>
 
-#include "alnumeric.h"
 #include "AL/al.h"
+#include "AL/alext.h"
 #include "core/effects/base.h"
 #include "call.h"
+
+inline bool EaxTraceCommits{false};
 
 struct EaxEffectErrorMessages {
     static constexpr auto unknown_property_id() noexcept { return "Unknown property id."; }
@@ -36,7 +37,7 @@ struct overloaded : Ts... { using Ts::operator()...; };
 template<typename... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
 
-constexpr ALenum EnumFromEaxEffectType(const EaxEffectProps &props) noexcept
+constexpr ALenum EnumFromEaxEffectType(const EaxEffectProps &props)
 {
     return std::visit(overloaded{
         [](const std::monostate&) noexcept { return AL_EFFECT_NULL; },
@@ -72,7 +73,7 @@ struct EaxReverbCommitter {
     template<typename TValidator, typename TProperty>
     static void defer(const EaxCall& call, TProperty& property)
     {
-        const auto& value = call.get_value<Exception, const TProperty>();
+        const auto &value = call.load<const TProperty>();
         TValidator{}(value);
         property = value;
     }
@@ -80,7 +81,7 @@ struct EaxReverbCommitter {
     template<typename TValidator, typename TDeferrer, typename TProperties, typename TProperty>
     static void defer(const EaxCall& call, TProperties& properties, TProperty&)
     {
-        const auto& value = call.get_value<Exception, const TProperty>();
+        const auto &value = call.load<const TProperty>();
         TValidator{}(value);
         TDeferrer{}(properties, value);
     }
@@ -88,9 +89,9 @@ struct EaxReverbCommitter {
     template<typename TValidator, typename TProperty>
     static void defer3(const EaxCall& call, EAXREVERBPROPERTIES& properties, TProperty& property)
     {
-        const auto& value = call.get_value<Exception, const TProperty>();
+        const auto& value = call.load<const TProperty>();
         TValidator{}(value);
-        if (value == property)
+        if(value == property)
             return;
         property = value;
         properties.ulEnvironment = EAX_ENVIRONMENT_UNDEFINED;
@@ -122,17 +123,13 @@ template<typename T>
 struct EaxCommitter {
     struct Exception;
 
-    EaxCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
-        : mEaxProps{eaxprops}, mAlProps{alprops}
-    { }
-
     EaxEffectProps &mEaxProps;
     EffectProps &mAlProps;
 
     template<typename TValidator, typename TProperty>
-    static void defer(const EaxCall& call, TProperty& property)
+    static void defer(const EaxCall &call, TProperty &property)
     {
-        const auto& value = call.get_value<Exception, const TProperty>();
+        const auto &value = call.load<const TProperty>();
         TValidator{}(value);
         property = value;
     }
@@ -140,10 +137,19 @@ struct EaxCommitter {
     [[noreturn]] static void fail(const char *message);
     [[noreturn]] static void fail_unknown_property_id()
     { fail(EaxEffectErrorMessages::unknown_property_id()); }
+
+private:
+    EaxCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : mEaxProps{eaxprops}, mAlProps{alprops}
+    { }
+
+    friend T;
 };
 
 struct EaxAutowahCommitter : public EaxCommitter<EaxAutowahCommitter> {
-    using EaxCommitter<EaxAutowahCommitter>::EaxCommitter;
+    EaxAutowahCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXAUTOWAHPROPERTIES &props);
 
@@ -152,7 +158,9 @@ struct EaxAutowahCommitter : public EaxCommitter<EaxAutowahCommitter> {
     static void Set(const EaxCall &call, EAXAUTOWAHPROPERTIES &props);
 };
 struct EaxChorusCommitter : public EaxCommitter<EaxChorusCommitter> {
-    using EaxCommitter<EaxChorusCommitter>::EaxCommitter;
+    EaxChorusCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXCHORUSPROPERTIES &props);
 
@@ -161,7 +169,9 @@ struct EaxChorusCommitter : public EaxCommitter<EaxChorusCommitter> {
     static void Set(const EaxCall &call, EAXCHORUSPROPERTIES &props);
 };
 struct EaxCompressorCommitter : public EaxCommitter<EaxCompressorCommitter> {
-    using EaxCommitter<EaxCompressorCommitter>::EaxCommitter;
+    EaxCompressorCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXAGCCOMPRESSORPROPERTIES &props);
 
@@ -170,7 +180,9 @@ struct EaxCompressorCommitter : public EaxCommitter<EaxCompressorCommitter> {
     static void Set(const EaxCall &call, EAXAGCCOMPRESSORPROPERTIES &props);
 };
 struct EaxDistortionCommitter : public EaxCommitter<EaxDistortionCommitter> {
-    using EaxCommitter<EaxDistortionCommitter>::EaxCommitter;
+    EaxDistortionCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXDISTORTIONPROPERTIES &props);
 
@@ -179,7 +191,9 @@ struct EaxDistortionCommitter : public EaxCommitter<EaxDistortionCommitter> {
     static void Set(const EaxCall &call, EAXDISTORTIONPROPERTIES &props);
 };
 struct EaxEchoCommitter : public EaxCommitter<EaxEchoCommitter> {
-    using EaxCommitter<EaxEchoCommitter>::EaxCommitter;
+    EaxEchoCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXECHOPROPERTIES &props);
 
@@ -188,7 +202,9 @@ struct EaxEchoCommitter : public EaxCommitter<EaxEchoCommitter> {
     static void Set(const EaxCall &call, EAXECHOPROPERTIES &props);
 };
 struct EaxEqualizerCommitter : public EaxCommitter<EaxEqualizerCommitter> {
-    using EaxCommitter<EaxEqualizerCommitter>::EaxCommitter;
+    EaxEqualizerCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXEQUALIZERPROPERTIES &props);
 
@@ -197,7 +213,9 @@ struct EaxEqualizerCommitter : public EaxCommitter<EaxEqualizerCommitter> {
     static void Set(const EaxCall &call, EAXEQUALIZERPROPERTIES &props);
 };
 struct EaxFlangerCommitter : public EaxCommitter<EaxFlangerCommitter> {
-    using EaxCommitter<EaxFlangerCommitter>::EaxCommitter;
+    EaxFlangerCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXFLANGERPROPERTIES &props);
 
@@ -206,7 +224,9 @@ struct EaxFlangerCommitter : public EaxCommitter<EaxFlangerCommitter> {
     static void Set(const EaxCall &call, EAXFLANGERPROPERTIES &props);
 };
 struct EaxFrequencyShifterCommitter : public EaxCommitter<EaxFrequencyShifterCommitter> {
-    using EaxCommitter<EaxFrequencyShifterCommitter>::EaxCommitter;
+    EaxFrequencyShifterCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXFREQUENCYSHIFTERPROPERTIES &props);
 
@@ -215,7 +235,9 @@ struct EaxFrequencyShifterCommitter : public EaxCommitter<EaxFrequencyShifterCom
     static void Set(const EaxCall &call, EAXFREQUENCYSHIFTERPROPERTIES &props);
 };
 struct EaxModulatorCommitter : public EaxCommitter<EaxModulatorCommitter> {
-    using EaxCommitter<EaxModulatorCommitter>::EaxCommitter;
+    EaxModulatorCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXRINGMODULATORPROPERTIES &props);
 
@@ -224,7 +246,9 @@ struct EaxModulatorCommitter : public EaxCommitter<EaxModulatorCommitter> {
     static void Set(const EaxCall &call, EAXRINGMODULATORPROPERTIES &props);
 };
 struct EaxPitchShifterCommitter : public EaxCommitter<EaxPitchShifterCommitter> {
-    using EaxCommitter<EaxPitchShifterCommitter>::EaxCommitter;
+    EaxPitchShifterCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXPITCHSHIFTERPROPERTIES &props);
 
@@ -233,7 +257,9 @@ struct EaxPitchShifterCommitter : public EaxCommitter<EaxPitchShifterCommitter> 
     static void Set(const EaxCall &call, EAXPITCHSHIFTERPROPERTIES &props);
 };
 struct EaxVocalMorpherCommitter : public EaxCommitter<EaxVocalMorpherCommitter> {
-    using EaxCommitter<EaxVocalMorpherCommitter>::EaxCommitter;
+    EaxVocalMorpherCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const EAXVOCALMORPHERPROPERTIES &props);
 
@@ -242,7 +268,9 @@ struct EaxVocalMorpherCommitter : public EaxCommitter<EaxVocalMorpherCommitter> 
     static void Set(const EaxCall &call, EAXVOCALMORPHERPROPERTIES &props);
 };
 struct EaxNullCommitter : public EaxCommitter<EaxNullCommitter> {
-    using EaxCommitter<EaxNullCommitter>::EaxCommitter;
+    EaxNullCommitter(EaxEffectProps &eaxprops, EffectProps &alprops)
+        : EaxCommitter{eaxprops, alprops}
+    { }
 
     bool commit(const std::monostate &props);
 
@@ -269,7 +297,7 @@ template<> struct CommitterFromProps<EAXPITCHSHIFTERPROPERTIES> { using type = E
 template<> struct CommitterFromProps<EAXVOCALMORPHERPROPERTIES> { using type = EaxVocalMorpherCommitter; };
 
 template<typename T>
-using CommitterFor = typename CommitterFromProps<std::remove_cv_t<std::remove_reference_t<T>>>::type;
+using CommitterFor = typename CommitterFromProps<std::remove_cvref_t<T>>::type;
 
 
 class EaxEffect {
@@ -278,7 +306,7 @@ public:
     ~EaxEffect() = default;
 
     ALenum al_effect_type_{AL_EFFECT_NULL};
-    EffectProps al_effect_props_{};
+    EffectProps al_effect_props_;
 
     using Props1 = EAX_REVERBPROPERTIES;
     using Props2 = EAX20LISTENERPROPERTIES;
@@ -307,7 +335,7 @@ public:
 
     int version_{};
     bool changed_{};
-    Props4 props_{};
+    Props4 props_;
     State1 state1_{};
     State2 state2_{};
     State3 state3_{};
@@ -315,7 +343,7 @@ public:
     State4 state5_{};
 
 
-    void call_set_defaults(const ALenum altype, EaxEffectProps &props)
+    static void call_set_defaults(const ALenum altype, EaxEffectProps &props)
     {
         switch(altype)
         {
@@ -393,7 +421,7 @@ public:
         props);
     }
 
-    void get(const EaxCall &call)
+    void get(const EaxCall &call) const
     {
         switch(call.get_version())
         {

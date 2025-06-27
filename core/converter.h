@@ -9,11 +9,15 @@
 #include "devformat.h"
 #include "flexarray.h"
 #include "mixer/defs.h"
+#include "resampler_limits.h"
 
 using uint = unsigned int;
 
 
-struct SampleConverter {
+class SampleConverter {
+    explicit SampleConverter(size_t numchans) : mChan{numchans} { }
+
+public:
     DevFmtType mSrcType{};
     DevFmtType mDstType{};
     uint mSrcTypeSize{};
@@ -23,7 +27,7 @@ struct SampleConverter {
 
     uint mFracOffset{};
     uint mIncrement{};
-    InterpState mState{};
+    InterpState mState;
     ResamplerFunc mResample{};
 
     alignas(16) FloatBufferLine mSrcSamples{};
@@ -33,8 +37,6 @@ struct SampleConverter {
         alignas(16) std::array<float,MaxResamplerPadding> PrevSamples;
     };
     al::FlexArray<ChanSamples> mChan;
-
-    SampleConverter(size_t numchans) : mChan{numchans} { }
 
     [[nodiscard]] auto convert(const void **src, uint *srcframes, void *dst, uint dstframes) -> uint;
     [[nodiscard]] auto convertPlanar(const void **src, uint *srcframes, void *const*dst, uint dstframes) -> uint;
@@ -47,8 +49,8 @@ struct SampleConverter {
         return SampleOffset{(prep<<MixerFracBits) + mFracOffset};
     }
 
-    static std::unique_ptr<SampleConverter> Create(DevFmtType srcType, DevFmtType dstType,
-        size_t numchans, uint srcRate, uint dstRate, Resampler resampler);
+    static auto Create(DevFmtType srcType, DevFmtType dstType, size_t numchans, uint srcRate,
+        uint dstRate, Resampler resampler) -> std::unique_ptr<SampleConverter>;
 
     DEF_FAM_NEWDEL(SampleConverter, mChan)
 };

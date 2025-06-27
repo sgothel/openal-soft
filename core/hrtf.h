@@ -5,21 +5,22 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "almalloc.h"
-#include "alspan.h"
-#include "atomic.h"
 #include "ambidefs.h"
 #include "bufferline.h"
 #include "flexarray.h"
 #include "intrusive_ptr.h"
 #include "mixer/hrtfdefs.h"
+#include "opthelpers.h"
 
 
-struct alignas(16) HrtfStore {
-    std::atomic<uint> mRef;
+struct SIMDALIGN HrtfStore {
+    alignas(16) std::atomic<uint> mRef;
 
     uint mSampleRate : 24;
     uint mIrSize : 8;
@@ -31,24 +32,24 @@ struct alignas(16) HrtfStore {
     /* NOTE: Fields are stored *backwards*. field[0] is the farthest field, and
      * field[fdCount-1] is the nearest.
      */
-    al::span<const Field> mFields;
+    std::span<const Field> mFields;
 
     struct Elevation {
         ushort azCount;
         ushort irOffset;
     };
-    Elevation *mElev;
-    const HrirArray *mCoeffs;
-    const ubyte2 *mDelays;
+    std::span<Elevation> mElev;
+    std::span<const HrirArray> mCoeffs;
+    std::span<const ubyte2> mDelays;
 
-    void getCoeffs(float elevation, float azimuth, float distance, float spread, HrirArray &coeffs,
-        const al::span<uint,2> delays);
+    void getCoeffs(float elevation, float azimuth, float distance, float spread,
+        const HrirSpan coeffs, const std::span<uint,2> delays) const;
 
-    void add_ref();
-    void dec_ref();
+    void inc_ref() noexcept;
+    void dec_ref() noexcept;
 
-    void *operator new(size_t) = delete;
-    void *operator new[](size_t) = delete;
+    auto operator new(size_t) -> void* = delete;
+    auto operator new[](size_t) -> void* = delete;
     void operator delete[](void*) noexcept = delete;
 
     void operator delete(gsl::owner<void*> block, void*) noexcept
@@ -67,14 +68,16 @@ struct AngularPoint {
 };
 
 
-struct DirectHrtfState {
+class DirectHrtfState {
+    explicit DirectHrtfState(size_t numchans) : mChannels{numchans} { }
+
+public:
     std::array<float,BufferLineSize> mTemp{};
 
     /* HRTF filter state for dry buffer content */
-    uint mIrSize{0};
+    uint mIrSize{0u};
     al::FlexArray<HrtfChannelState> mChannels;
 
-    DirectHrtfState(size_t numchans) : mChannels{numchans} { }
     /**
      * Produces HRTF filter coefficients for decoding B-Format, given a set of
      * virtual speaker positions, a matching decoding matrix, and per-order
@@ -82,17 +85,17 @@ struct DirectHrtfState {
      * are ordered and scaled according to the matrix input.
      */
     void build(const HrtfStore *Hrtf, const uint irSize, const bool perHrirMin,
-        const al::span<const AngularPoint> AmbiPoints,
-        const al::span<const std::array<float,MaxAmbiChannels>> AmbiMatrix,
-        const float XOverFreq, const al::span<const float,MaxAmbiOrder+1> AmbiOrderHFGain);
+        const std::span<const AngularPoint> AmbiPoints,
+        const std::span<const std::array<float,MaxAmbiChannels>> AmbiMatrix,
+        const float XOverFreq, const std::span<const float,MaxAmbiOrder+1> AmbiOrderHFGain);
 
-    static std::unique_ptr<DirectHrtfState> Create(size_t num_chans);
+    static auto Create(size_t num_chans) -> std::unique_ptr<DirectHrtfState>;
 
     DEF_FAM_NEWDEL(DirectHrtfState, mChannels)
 };
 
 
-std::vector<std::string> EnumerateHrtf(std::optional<std::string> pathopt);
-HrtfStorePtr GetLoadedHrtf(const std::string &name, const uint devrate);
+auto EnumerateHrtf(std::optional<std::string> pathopt) -> std::vector<std::string>;
+auto GetLoadedHrtf(const std::string_view name, const uint devrate) -> HrtfStorePtr;
 
 #endif /* CORE_HRTF_H */

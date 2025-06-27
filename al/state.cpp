@@ -22,37 +22,38 @@
 
 #include "version.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
-#include <cstring>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "AL/al.h"
 #include "AL/alc.h"
 #include "AL/alext.h"
 
 #include "al/debug.h"
-#include "albit.h"
+#include "al/listener.h"
 #include "alc/alu.h"
 #include "alc/context.h"
+#include "alc/device.h"
 #include "alc/inprogext.h"
 #include "alnumeric.h"
 #include "atomic.h"
 #include "core/context.h"
-#include "core/except.h"
+#include "core/logging.h"
 #include "core/mixer/defs.h"
 #include "core/voice.h"
 #include "direct_defs.h"
 #include "intrusive_ptr.h"
 #include "opthelpers.h"
-#include "strutils.h"
+#include "strutils.hpp"
 
-#ifdef ALSOFT_EAX
-#include "alc/device.h"
-
+#if ALSOFT_EAX
 #include "eax/globals.h"
 #include "eax/x_ram.h"
 #endif // ALSOFT_EAX
@@ -60,21 +61,21 @@
 
 namespace {
 
-/* NOLINTBEGIN(*-avoid-c-arrays) */
-constexpr ALchar alVendor[] = "OpenAL Community";
-constexpr ALchar alVersion[] = "1.1 ALSOFT " ALSOFT_VERSION;
-constexpr ALchar alRenderer[] = "OpenAL Soft";
+using ALvoidptr = ALvoid*;
 
-// Error Messages
-constexpr ALchar alNoError[] = "No Error";
-constexpr ALchar alErrInvalidName[] = "Invalid Name";
-constexpr ALchar alErrInvalidEnum[] = "Invalid Enum";
-constexpr ALchar alErrInvalidValue[] = "Invalid Value";
-constexpr ALchar alErrInvalidOp[] = "Invalid Operation";
-constexpr ALchar alErrOutOfMemory[] = "Out of Memory";
-constexpr ALchar alStackOverflow[] = "Stack Overflow";
-constexpr ALchar alStackUnderflow[] = "Stack Underflow";
-/* NOLINTEND(*-avoid-c-arrays) */
+[[nodiscard]] constexpr auto GetVendorString() noexcept { return "OpenAL Community"; }
+[[nodiscard]] constexpr auto GetVersionString() noexcept { return "1.1 ALSOFT " ALSOFT_VERSION; }
+[[nodiscard]] constexpr auto GetRendererString() noexcept { return "OpenAL Soft"; }
+
+/* Error Messages */
+[[nodiscard]] constexpr auto GetNoErrorString() noexcept { return "No Error"; }
+[[nodiscard]] constexpr auto GetInvalidNameString() noexcept { return "Invalid Name"; }
+[[nodiscard]] constexpr auto GetInvalidEnumString() noexcept { return "Invalid Enum"; }
+[[nodiscard]] constexpr auto GetInvalidValueString() noexcept { return "Invalid Value"; }
+[[nodiscard]] constexpr auto GetInvalidOperationString() noexcept { return "Invalid Operation"; }
+[[nodiscard]] constexpr auto GetOutOfMemoryString() noexcept { return "Out of Memory"; }
+[[nodiscard]] constexpr auto GetStackOverflowString() noexcept { return "Stack Overflow"; }
+[[nodiscard]] constexpr auto GetStackUnderflowString() noexcept { return "Stack Underflow"; }
 
 /* Resampler strings */
 template<Resampler rtype> struct ResamplerName { };
@@ -82,8 +83,10 @@ template<> struct ResamplerName<Resampler::Point>
 { static constexpr const ALchar *Get() noexcept { return "Nearest"; } };
 template<> struct ResamplerName<Resampler::Linear>
 { static constexpr const ALchar *Get() noexcept { return "Linear"; } };
-template<> struct ResamplerName<Resampler::Cubic>
-{ static constexpr const ALchar *Get() noexcept { return "Cubic"; } };
+template<> struct ResamplerName<Resampler::Spline>
+{ static constexpr const ALchar *Get() noexcept { return "Cubic Spline"; } };
+template<> struct ResamplerName<Resampler::Gaussian>
+{ static constexpr const ALchar *Get() noexcept { return "4-point Gaussian"; } };
 template<> struct ResamplerName<Resampler::FastBSinc12>
 { static constexpr const ALchar *Get() noexcept { return "11th order Sinc (fast)"; } };
 template<> struct ResamplerName<Resampler::BSinc12>
@@ -92,26 +95,33 @@ template<> struct ResamplerName<Resampler::FastBSinc24>
 { static constexpr const ALchar *Get() noexcept { return "23rd order Sinc (fast)"; } };
 template<> struct ResamplerName<Resampler::BSinc24>
 { static constexpr const ALchar *Get() noexcept { return "23rd order Sinc"; } };
+template<> struct ResamplerName<Resampler::FastBSinc48>
+{ static constexpr const ALchar *Get() noexcept { return "47th order Sinc (fast)"; } };
+template<> struct ResamplerName<Resampler::BSinc48>
+{ static constexpr const ALchar *Get() noexcept { return "47th order Sinc"; } };
 
-const ALchar *GetResamplerName(const Resampler rtype)
+constexpr auto GetResamplerName(const Resampler rtype) -> const ALchar*
 {
 #define HANDLE_RESAMPLER(r) case r: return ResamplerName<r>::Get()
     switch(rtype)
     {
     HANDLE_RESAMPLER(Resampler::Point);
     HANDLE_RESAMPLER(Resampler::Linear);
-    HANDLE_RESAMPLER(Resampler::Cubic);
+    HANDLE_RESAMPLER(Resampler::Spline);
+    HANDLE_RESAMPLER(Resampler::Gaussian);
     HANDLE_RESAMPLER(Resampler::FastBSinc12);
     HANDLE_RESAMPLER(Resampler::BSinc12);
     HANDLE_RESAMPLER(Resampler::FastBSinc24);
     HANDLE_RESAMPLER(Resampler::BSinc24);
+    HANDLE_RESAMPLER(Resampler::FastBSinc48);
+    HANDLE_RESAMPLER(Resampler::BSinc48);
     }
 #undef HANDLE_RESAMPLER
     /* Should never get here. */
     throw std::runtime_error{"Unexpected resampler index"};
 }
 
-std::optional<DistanceModel> DistanceModelFromALenum(ALenum model)
+constexpr auto DistanceModelFromALenum(ALenum model) noexcept -> std::optional<DistanceModel>
 {
     switch(model)
     {
@@ -125,7 +135,7 @@ std::optional<DistanceModel> DistanceModelFromALenum(ALenum model)
     }
     return std::nullopt;
 }
-ALenum ALenumFromDistanceModel(DistanceModel model)
+constexpr auto ALenumFromDistanceModel(DistanceModel model) -> ALenum
 {
     switch(model)
     {
@@ -137,28 +147,28 @@ ALenum ALenumFromDistanceModel(DistanceModel model)
     case DistanceModel::Exponent: return AL_EXPONENT_DISTANCE;
     case DistanceModel::ExponentClamped: return AL_EXPONENT_DISTANCE_CLAMPED;
     }
-    throw std::runtime_error{"Unexpected distance model "+std::to_string(static_cast<int>(model))};
+    throw std::runtime_error{fmt::format("Unexpected distance model {}", static_cast<int>(model))};
 }
 
 enum PropertyValue : ALenum {
-    DopplerFactor = AL_DOPPLER_FACTOR,
-    DopplerVelocity = AL_DOPPLER_VELOCITY,
-    DistanceModel = AL_DISTANCE_MODEL,
-    SpeedOfSound = AL_SPEED_OF_SOUND,
-    DeferredUpdates = AL_DEFERRED_UPDATES_SOFT,
-    GainLimit = AL_GAIN_LIMIT_SOFT,
-    NumResamplers = AL_NUM_RESAMPLERS_SOFT,
-    DefaultResampler = AL_DEFAULT_RESAMPLER_SOFT,
-    DebugLoggedMessages = AL_DEBUG_LOGGED_MESSAGES_EXT,
-    DebugNextLoggedMessageLength = AL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH_EXT,
-    MaxDebugMessageLength = AL_MAX_DEBUG_MESSAGE_LENGTH_EXT,
-    MaxDebugLoggedMessages = AL_MAX_DEBUG_LOGGED_MESSAGES_EXT,
-    MaxDebugGroupDepth = AL_MAX_DEBUG_GROUP_STACK_DEPTH_EXT,
-    MaxLabelLength = AL_MAX_LABEL_LENGTH_EXT,
-    ContextFlags = AL_CONTEXT_FLAGS_EXT,
-#ifdef ALSOFT_EAX
-    EaxRamSize = AL_EAX_RAM_SIZE,
-    EaxRamFree = AL_EAX_RAM_FREE,
+    DopplerFactorProp = AL_DOPPLER_FACTOR,
+    DopplerVelocityProp = AL_DOPPLER_VELOCITY,
+    DistanceModelProp = AL_DISTANCE_MODEL,
+    SpeedOfSoundProp = AL_SPEED_OF_SOUND,
+    DeferredUpdatesProp = AL_DEFERRED_UPDATES_SOFT,
+    GainLimitProp = AL_GAIN_LIMIT_SOFT,
+    NumResamplersProp = AL_NUM_RESAMPLERS_SOFT,
+    DefaultResamplerProp = AL_DEFAULT_RESAMPLER_SOFT,
+    DebugLoggedMessagesProp = AL_DEBUG_LOGGED_MESSAGES_EXT,
+    DebugNextLoggedMessageLengthProp = AL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH_EXT,
+    MaxDebugMessageLengthProp = AL_MAX_DEBUG_MESSAGE_LENGTH_EXT,
+    MaxDebugLoggedMessagesProp = AL_MAX_DEBUG_LOGGED_MESSAGES_EXT,
+    MaxDebugGroupDepthProp = AL_MAX_DEBUG_GROUP_STACK_DEPTH_EXT,
+    MaxLabelLengthProp = AL_MAX_LABEL_LENGTH_EXT,
+    ContextFlagsProp = AL_CONTEXT_FLAGS_EXT,
+#if ALSOFT_EAX
+    EaxRamSizeProp = AL_EAX_RAM_SIZE,
+    EaxRamFreeProp = AL_EAX_RAM_FREE,
 #endif
 };
 
@@ -180,7 +190,7 @@ struct PropertyCastType<ALboolean> {
 template<typename T>
 void GetValue(ALCcontext *context, ALenum pname, T *values)
 {
-    auto cast_value = PropertyCastType<T>{};
+    static constexpr auto cast_value = PropertyCastType<T>{};
 
     switch(static_cast<PropertyValue>(pname))
     {
@@ -189,7 +199,7 @@ void GetValue(ALCcontext *context, ALenum pname, T *values)
         return;
 
     case AL_DOPPLER_VELOCITY:
-        if(context->mContextFlags.test(ContextFlags::DebugBit)) UNLIKELY
+        if(context->mContextFlags.test(ContextFlags::DebugBit)) [[unlikely]]
             context->debugMessage(DebugSource::API, DebugType::DeprecatedBehavior, 0,
                 DebugSeverity::Medium,
                 "AL_DOPPLER_VELOCITY is deprecated in AL 1.1, use AL_SPEED_OF_SOUND; "
@@ -223,14 +233,14 @@ void GetValue(ALCcontext *context, ALenum pname, T *values)
 
     case AL_DEBUG_LOGGED_MESSAGES_EXT:
     {
-        std::lock_guard<std::mutex> _{context->mDebugCbLock};
+        auto debuglock = std::lock_guard{context->mDebugCbLock};
         *values = cast_value(context->mDebugLog.size());
         return;
     }
 
     case AL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH_EXT:
     {
-        std::lock_guard<std::mutex> _{context->mDebugCbLock};
+        auto debuglock = std::lock_guard{context->mDebugCbLock};
         *values = cast_value(context->mDebugLog.empty() ? 0_uz
             : (context->mDebugLog.front().mMessage.size()+1));
         return;
@@ -256,9 +266,8 @@ void GetValue(ALCcontext *context, ALenum pname, T *values)
         *values = cast_value(context->mContextFlags.to_ulong());
         return;
 
-#ifdef ALSOFT_EAX
-
-#define EAX_ERROR "[alGetInteger] EAX not enabled."
+#if ALSOFT_EAX
+#define EAX_ERROR "[alGetInteger] EAX not enabled"
 
     case AL_EAX_RAM_SIZE:
         if(eax_g_is_enabled)
@@ -266,25 +275,24 @@ void GetValue(ALCcontext *context, ALenum pname, T *values)
             *values = cast_value(eax_x_ram_max_size);
             return;
         }
-        context->setError(AL_INVALID_ENUM, EAX_ERROR);
-        return;
+        ERR(EAX_ERROR);
+        break;
 
     case AL_EAX_RAM_FREE:
         if(eax_g_is_enabled)
         {
-            auto device = context->mALDevice.get();
-            std::lock_guard<std::mutex> device_lock{device->BufferLock};
+            auto *device = context->mALDevice.get();
+            auto devlock = std::lock_guard{device->BufferLock};
             *values = cast_value(device->eax_x_ram_free_size);
             return;
         }
-        context->setError(AL_INVALID_ENUM, EAX_ERROR);
-        return;
+        ERR(EAX_ERROR);
+        break;
 
 #undef EAX_ERROR
-
 #endif // ALSOFT_EAX
     }
-    context->setError(AL_INVALID_ENUM, "Invalid context property 0x%04x", pname);
+    context->setError(AL_INVALID_ENUM, "Invalid context property {:#04x}", as_unsigned(pname));
 }
 
 
@@ -309,332 +317,295 @@ AL_API auto AL_APIENTRY alsoft_get_version() noexcept -> const ALchar*
 }
 
 
-AL_API DECL_FUNC1(void, alEnable, ALenum)
+AL_API DECL_FUNC1(void, alEnable, ALenum,capability)
 FORCE_ALIGN void AL_APIENTRY alEnableDirect(ALCcontext *context, ALenum capability) noexcept
 {
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
         {
-            std::lock_guard<std::mutex> _{context->mPropLock};
+            auto proplock = std::lock_guard{context->mPropLock};
             context->mSourceDistanceModel = true;
             UpdateProps(context);
         }
-        break;
+        return;
 
     case AL_DEBUG_OUTPUT_EXT:
-        context->mDebugEnabled = true;
-        break;
+        context->mDebugEnabled.store(true);
+        return;
 
     case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
         context->setError(AL_INVALID_OPERATION, "Re-enabling AL_STOP_SOURCES_ON_DISCONNECT_SOFT not yet supported");
-        break;
-
-    default:
-        context->setError(AL_INVALID_VALUE, "Invalid enable property 0x%04x", capability);
+        return;
     }
+    context->setError(AL_INVALID_VALUE, "Invalid enable property {:#04x}",
+        as_unsigned(capability));
 }
 
-AL_API DECL_FUNC1(void, alDisable, ALenum)
+AL_API DECL_FUNC1(void, alDisable, ALenum,capability)
 FORCE_ALIGN void AL_APIENTRY alDisableDirect(ALCcontext *context, ALenum capability) noexcept
 {
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
         {
-            std::lock_guard<std::mutex> _{context->mPropLock};
+            auto proplock = std::lock_guard{context->mPropLock};
             context->mSourceDistanceModel = false;
             UpdateProps(context);
         }
-        break;
+        return;
 
     case AL_DEBUG_OUTPUT_EXT:
-        context->mDebugEnabled = false;
-        break;
+        context->mDebugEnabled.store(false);
+        return;
 
     case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
-        context->mStopVoicesOnDisconnect = false;
-        break;
-
-    default:
-        context->setError(AL_INVALID_VALUE, "Invalid disable property 0x%04x", capability);
+        context->mStopVoicesOnDisconnect.store(false);
+        return;
     }
+    context->setError(AL_INVALID_VALUE, "Invalid disable property {:#04x}",
+        as_unsigned(capability));
 }
 
-AL_API DECL_FUNC1(ALboolean, alIsEnabled, ALenum)
+AL_API DECL_FUNC1(ALboolean, alIsEnabled, ALenum,capability)
 FORCE_ALIGN ALboolean AL_APIENTRY alIsEnabledDirect(ALCcontext *context, ALenum capability) noexcept
 {
-    std::lock_guard<std::mutex> _{context->mPropLock};
-    ALboolean value{AL_FALSE};
+    auto proplock = std::lock_guard{context->mPropLock};
     switch(capability)
     {
-    case AL_SOURCE_DISTANCE_MODEL:
-        value = context->mSourceDistanceModel ? AL_TRUE : AL_FALSE;
-        break;
-
-    case AL_DEBUG_OUTPUT_EXT:
-        value = context->mDebugEnabled ? AL_TRUE : AL_FALSE;
-        break;
-
+    case AL_SOURCE_DISTANCE_MODEL: return context->mSourceDistanceModel ? AL_TRUE : AL_FALSE;
+    case AL_DEBUG_OUTPUT_EXT: return context->mDebugEnabled ? AL_TRUE : AL_FALSE;
     case AL_STOP_SOURCES_ON_DISCONNECT_SOFT:
-        value = context->mStopVoicesOnDisconnect ? AL_TRUE : AL_FALSE;
-        break;
-
-    default:
-        context->setError(AL_INVALID_VALUE, "Invalid is enabled property 0x%04x", capability);
+        return context->mStopVoicesOnDisconnect.load() ? AL_TRUE : AL_FALSE;
     }
-
-    return value;
+    context->setError(AL_INVALID_VALUE, "Invalid is enabled property {:#04x}",
+        as_unsigned(capability));
+    return AL_FALSE;
 }
 
 #define DECL_GETFUNC(R, Name, Ext)                                            \
-AL_API auto AL_APIENTRY Name##Ext(ALenum pname) noexcept -> R                 \
+auto AL_APIENTRY Name##Ext(ALenum pname) noexcept -> R                        \
 {                                                                             \
-    R value{};                                                                \
+    auto value = R{};                                                         \
     auto context = GetContextRef();                                           \
-    if(!context) UNLIKELY return value;                                       \
-    Name##vDirect##Ext(GetContextRef().get(), pname, &value);                 \
+    if(context) [[likely]] Name##vDirect##Ext(context.get(), pname, &value);  \
     return value;                                                             \
 }                                                                             \
-FORCE_ALIGN auto AL_APIENTRY Name##Direct##Ext(ALCcontext *context, ALenum pname) noexcept -> R \
+FORCE_ALIGN auto AL_APIENTRY Name##Direct##Ext(ALCcontext *context,           \
+    ALenum pname) noexcept -> R                                               \
 {                                                                             \
-    R value{};                                                                \
+    auto value = R{};                                                         \
     Name##vDirect##Ext(context, pname, &value);                               \
     return value;                                                             \
 }
 
-DECL_GETFUNC(ALboolean, alGetBoolean,)
-DECL_GETFUNC(ALdouble, alGetDouble,)
-DECL_GETFUNC(ALfloat, alGetFloat,)
-DECL_GETFUNC(ALint, alGetInteger,)
+AL_API DECL_GETFUNC(ALboolean, alGetBoolean,)
+AL_API DECL_GETFUNC(ALdouble, alGetDouble,)
+AL_API DECL_GETFUNC(ALfloat, alGetFloat,)
+AL_API DECL_GETFUNC(ALint, alGetInteger,)
 
-DECL_GETFUNC(ALint64SOFT, alGetInteger64,SOFT)
-DECL_GETFUNC(ALvoid*, alGetPointer,SOFT)
+DECL_GETFUNC(ALvoidptr, alGetPointer,EXT)
+AL_API DECL_GETFUNC(ALint64SOFT, alGetInteger64,SOFT)
+AL_API DECL_GETFUNC(ALvoidptr, alGetPointer,SOFT)
 
 #undef DECL_GETFUNC
 
 
-AL_API DECL_FUNC2(void, alGetBooleanv, ALenum, ALboolean*)
+AL_API DECL_FUNC2(void, alGetBooleanv, ALenum,pname, ALboolean*,values)
 FORCE_ALIGN void AL_APIENTRY alGetBooleanvDirect(ALCcontext *context, ALenum pname, ALboolean *values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
     GetValue(context, pname, values);
 }
 
-AL_API DECL_FUNC2(void, alGetDoublev, ALenum, ALdouble*)
+AL_API DECL_FUNC2(void, alGetDoublev, ALenum,pname, ALdouble*,values)
 FORCE_ALIGN void AL_APIENTRY alGetDoublevDirect(ALCcontext *context, ALenum pname, ALdouble *values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
     GetValue(context, pname, values);
 }
 
-AL_API DECL_FUNC2(void, alGetFloatv, ALenum, ALfloat*)
+AL_API DECL_FUNC2(void, alGetFloatv, ALenum,pname, ALfloat*,values)
 FORCE_ALIGN void AL_APIENTRY alGetFloatvDirect(ALCcontext *context, ALenum pname, ALfloat *values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
     GetValue(context, pname, values);
 }
 
-AL_API DECL_FUNC2(void, alGetIntegerv, ALenum, ALint*)
+AL_API DECL_FUNC2(void, alGetIntegerv, ALenum,pname, ALint*,values)
 FORCE_ALIGN void AL_APIENTRY alGetIntegervDirect(ALCcontext *context, ALenum pname, ALint *values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
     GetValue(context, pname, values);
 }
 
-AL_API DECL_FUNCEXT2(void, alGetInteger64v,SOFT, ALenum, ALint64SOFT*)
+AL_API DECL_FUNCEXT2(void, alGetInteger64v,SOFT, ALenum,pname, ALint64SOFT*,values)
 FORCE_ALIGN void AL_APIENTRY alGetInteger64vDirectSOFT(ALCcontext *context, ALenum pname, ALint64SOFT *values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
     GetValue(context, pname, values);
 }
 
-AL_API DECL_FUNCEXT2(void, alGetPointerv,SOFT, ALenum, ALvoid**)
+AL_API DECL_FUNCEXT2(void, alGetPointerv,SOFT, ALenum,pname, ALvoid**,values)
 FORCE_ALIGN void AL_APIENTRY alGetPointervDirectSOFT(ALCcontext *context, ALenum pname, ALvoid **values) noexcept
+{ return alGetPointervDirectEXT(context, pname, values); }
+
+FORCE_ALIGN DECL_FUNCEXT2(void, alGetPointerv,EXT, ALenum,pname, ALvoid**,values)
+FORCE_ALIGN void AL_APIENTRY alGetPointervDirectEXT(ALCcontext *context, ALenum pname, ALvoid **values) noexcept
 {
-    if(!values) UNLIKELY
+    if(!values) [[unlikely]]
         return context->setError(AL_INVALID_VALUE, "NULL pointer");
 
     switch(pname)
     {
     case AL_EVENT_CALLBACK_FUNCTION_SOFT:
+        /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
         *values = reinterpret_cast<void*>(context->mEventCb);
-        break;
+        return;
 
     case AL_EVENT_CALLBACK_USER_PARAM_SOFT:
         *values = context->mEventParam;
-        break;
+        return;
 
     case AL_DEBUG_CALLBACK_FUNCTION_EXT:
+        /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
         *values = reinterpret_cast<void*>(context->mDebugCb);
-        break;
+        return;
 
     case AL_DEBUG_CALLBACK_USER_PARAM_EXT:
         *values = context->mDebugParam;
-        break;
-
-    default:
-        context->setError(AL_INVALID_ENUM, "Invalid context pointer property 0x%04x", pname);
+        return;
     }
+    context->setError(AL_INVALID_ENUM, "Invalid context pointer property {:#04x}",
+        as_unsigned(pname));
 }
 
-AL_API DECL_FUNC1(const ALchar*, alGetString, ALenum)
+AL_API DECL_FUNC1(const ALchar*, alGetString, ALenum,pname)
 FORCE_ALIGN const ALchar* AL_APIENTRY alGetStringDirect(ALCcontext *context, ALenum pname) noexcept
 {
-    const ALchar *value{nullptr};
     switch(pname)
     {
     case AL_VENDOR:
-        value = alVendor;
-        break;
-
+        if(auto device = context->mALDevice.get(); !device->mVendorOverride.empty())
+            return device->mVendorOverride.c_str();
+        return GetVendorString();
     case AL_VERSION:
-        value = alVersion;
-        break;
-
+        if(auto device = context->mALDevice.get(); !device->mVersionOverride.empty())
+            return device->mVersionOverride.c_str();
+        return GetVersionString();
     case AL_RENDERER:
-        value = alRenderer;
-        break;
-
-    case AL_EXTENSIONS:
-        value = context->mExtensionsString.c_str();
-        break;
-
-    case AL_NO_ERROR:
-        value = alNoError;
-        break;
-
-    case AL_INVALID_NAME:
-        value = alErrInvalidName;
-        break;
-
-    case AL_INVALID_ENUM:
-        value = alErrInvalidEnum;
-        break;
-
-    case AL_INVALID_VALUE:
-        value = alErrInvalidValue;
-        break;
-
-    case AL_INVALID_OPERATION:
-        value = alErrInvalidOp;
-        break;
-
-    case AL_OUT_OF_MEMORY:
-        value = alErrOutOfMemory;
-        break;
-
-    case AL_STACK_OVERFLOW_EXT:
-        value = alStackOverflow;
-        break;
-
-    case AL_STACK_UNDERFLOW_EXT:
-        value = alStackUnderflow;
-        break;
-
-    default:
-        context->setError(AL_INVALID_VALUE, "Invalid string property 0x%04x", pname);
+        if(auto device = context->mALDevice.get(); !device->mRendererOverride.empty())
+            return device->mRendererOverride.c_str();
+        return GetRendererString();
+    case AL_EXTENSIONS: return context->mExtensionsString.c_str();
+    case AL_NO_ERROR: return GetNoErrorString();
+    case AL_INVALID_NAME: return GetInvalidNameString();
+    case AL_INVALID_ENUM: return GetInvalidEnumString();
+    case AL_INVALID_VALUE: return GetInvalidValueString();
+    case AL_INVALID_OPERATION: return GetInvalidOperationString();
+    case AL_OUT_OF_MEMORY: return GetOutOfMemoryString();
+    case AL_STACK_OVERFLOW_EXT: return GetStackOverflowString();
+    case AL_STACK_UNDERFLOW_EXT: return GetStackUnderflowString();
     }
-    return value;
+    context->setError(AL_INVALID_VALUE, "Invalid string property {:#04x}", as_unsigned(pname));
+    return nullptr;
 }
 
-AL_API DECL_FUNC1(void, alDopplerFactor, ALfloat)
+AL_API DECL_FUNC1(void, alDopplerFactor, ALfloat,value)
 FORCE_ALIGN void AL_APIENTRY alDopplerFactorDirect(ALCcontext *context, ALfloat value) noexcept
 {
     if(!(value >= 0.0f && std::isfinite(value)))
-        context->setError(AL_INVALID_VALUE, "Doppler factor %f out of range", value);
+        context->setError(AL_INVALID_VALUE, "Doppler factor {} out of range", value);
     else
     {
-        std::lock_guard<std::mutex> _{context->mPropLock};
+        auto proplock = std::lock_guard{context->mPropLock};
         context->mDopplerFactor = value;
         UpdateProps(context);
     }
 }
 
-AL_API DECL_FUNC1(void, alSpeedOfSound, ALfloat)
+AL_API DECL_FUNC1(void, alSpeedOfSound, ALfloat,value)
 FORCE_ALIGN void AL_APIENTRY alSpeedOfSoundDirect(ALCcontext *context, ALfloat value) noexcept
 {
     if(!(value > 0.0f && std::isfinite(value)))
-        context->setError(AL_INVALID_VALUE, "Speed of sound %f out of range", value);
+        context->setError(AL_INVALID_VALUE, "Speed of sound {} out of range", value);
     else
     {
-        std::lock_guard<std::mutex> _{context->mPropLock};
+        auto proplock = std::lock_guard{context->mPropLock};
         context->mSpeedOfSound = value;
         UpdateProps(context);
     }
 }
 
-AL_API DECL_FUNC1(void, alDistanceModel, ALenum)
+AL_API DECL_FUNC1(void, alDistanceModel, ALenum,value)
 FORCE_ALIGN void AL_APIENTRY alDistanceModelDirect(ALCcontext *context, ALenum value) noexcept
 {
     if(auto model = DistanceModelFromALenum(value))
     {
-        std::lock_guard<std::mutex> _{context->mPropLock};
+        auto proplock = std::lock_guard{context->mPropLock};
         context->mDistanceModel = *model;
         if(!context->mSourceDistanceModel)
             UpdateProps(context);
     }
     else
-        context->setError(AL_INVALID_VALUE, "Distance model 0x%04x out of range", value);
+        context->setError(AL_INVALID_VALUE, "Distance model {:#04x} out of range",
+            as_unsigned(value));
 }
 
 
 AL_API DECL_FUNCEXT(void, alDeferUpdates,SOFT)
 FORCE_ALIGN void AL_APIENTRY alDeferUpdatesDirectSOFT(ALCcontext *context) noexcept
 {
-    std::lock_guard<std::mutex> _{context->mPropLock};
+    auto proplock = std::lock_guard{context->mPropLock};
     context->deferUpdates();
 }
 
 AL_API DECL_FUNCEXT(void, alProcessUpdates,SOFT)
 FORCE_ALIGN void AL_APIENTRY alProcessUpdatesDirectSOFT(ALCcontext *context) noexcept
 {
-    std::lock_guard<std::mutex> _{context->mPropLock};
+    auto proplock = std::lock_guard{context->mPropLock};
     context->processUpdates();
 }
 
 
-AL_API DECL_FUNCEXT2(const ALchar*, alGetStringi,SOFT, ALenum,ALsizei)
+AL_API DECL_FUNCEXT2(const ALchar*, alGetStringi,SOFT, ALenum,pname, ALsizei,index)
 FORCE_ALIGN const ALchar* AL_APIENTRY alGetStringiDirectSOFT(ALCcontext *context, ALenum pname, ALsizei index) noexcept
 {
-    const ALchar *value{nullptr};
     switch(pname)
     {
     case AL_RESAMPLER_NAME_SOFT:
-        if(index < 0 || index > static_cast<ALint>(Resampler::Max))
-            context->setError(AL_INVALID_VALUE, "Resampler name index %d out of range", index);
-        else
-            value = GetResamplerName(static_cast<Resampler>(index));
-        break;
-
-    default:
-        context->setError(AL_INVALID_VALUE, "Invalid string indexed property");
+        if(index >= 0 && index <= al::to_underlying(Resampler::Max))
+            return GetResamplerName(static_cast<Resampler>(index));
+        context->setError(AL_INVALID_VALUE, "Resampler name index {} out of range", index);
+        return nullptr;
     }
-    return value;
+    context->setError(AL_INVALID_VALUE, "Invalid string indexed property {:#04x}",
+        as_unsigned(pname));
+    return nullptr;
 }
 
 
 AL_API void AL_APIENTRY alDopplerVelocity(ALfloat value) noexcept
 {
-    ContextRef context{GetContextRef()};
-    if(!context) UNLIKELY return;
+    auto context = GetContextRef();
+    if(!context) [[unlikely]] return;
 
-    if(context->mContextFlags.test(ContextFlags::DebugBit)) UNLIKELY
-        context->debugMessage(DebugSource::API, DebugType::DeprecatedBehavior, 0,
+    if(context->mContextFlags.test(ContextFlags::DebugBit)) [[unlikely]]
+        context->debugMessage(DebugSource::API, DebugType::DeprecatedBehavior, 1,
             DebugSeverity::Medium,
             "alDopplerVelocity is deprecated in AL 1.1, use alSpeedOfSound; "
             "alDopplerVelocity(x) -> alSpeedOfSound(343.3f * x)");
 
     if(!(value >= 0.0f && std::isfinite(value)))
-        context->setError(AL_INVALID_VALUE, "Doppler velocity %f out of range", value);
+        context->setError(AL_INVALID_VALUE, "Doppler velocity {} out of range", value);
     else
     {
-        std::lock_guard<std::mutex> _{context->mPropLock};
+        auto proplock = std::lock_guard{context->mPropLock};
         context->mDopplerVelocity = value;
         UpdateProps(context.get());
     }
@@ -644,7 +615,7 @@ AL_API void AL_APIENTRY alDopplerVelocity(ALfloat value) noexcept
 void UpdateContextProps(ALCcontext *context)
 {
     /* Get an unused property container, or allocate a new one as needed. */
-    ContextProps *props{context->mFreeContextProps.load(std::memory_order_acquire)};
+    auto *props = context->mFreeContextProps.load(std::memory_order_acquire);
     if(!props)
     {
         context->allocContextProps();
@@ -657,7 +628,7 @@ void UpdateContextProps(ALCcontext *context)
         std::memory_order_acq_rel, std::memory_order_acquire) == false);
 
     /* Copy in current property values. */
-    ALlistener &listener = context->mListener;
+    const auto &listener = context->mListener;
     props->Position = listener.Position;
     props->Velocity = listener.Velocity;
     props->OrientAt = listener.OrientAt;
@@ -669,6 +640,9 @@ void UpdateContextProps(ALCcontext *context)
     props->DopplerFactor = context->mDopplerFactor;
     props->DopplerVelocity = context->mDopplerVelocity;
     props->SpeedOfSound = context->mSpeedOfSound;
+#if ALSOFT_EAX
+    props->DistanceFactor = context->eaxGetDistanceFactor();
+#endif
 
     props->SourceDistanceModel = context->mSourceDistanceModel;
     props->mDistanceModel = context->mDistanceModel;
